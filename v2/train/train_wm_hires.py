@@ -45,319 +45,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from models.vqvae_hires import VQVAEHiRes
 from models.temporal_world_model import TemporalVisualWorldModel
 from data.atari_dataset import AtariTemporalDataset
+from data.multistep_dataset import MultiStepDataset
 from eval.gold_eval import GoldEvalSuite, run_gold_eval, format_gold_metrics
-
-
-# =============================================================================
-# v2.0: Hybrid Token Importance Weighting
-# =============================================================================
-# Combines multiple signals for robust, game-agnostic importance:
-#   - Embedding-distance motion (robust to codebook jitter)
-#   - Eventness spike detection (catches "fire" moments)
-#   - Multi-frame persistence (stabilizes tracking)
-#   - Percentile-based safe capping (prevents context starvation)
-
-def compute_hybrid_importance_weights(
-    target_tokens: torch.Tensor,      # (B, N)
-    history_tokens: torch.Tensor,     # (B, T, N)
-    token_embedding: torch.nn.Embedding,  # Model's token embedding layer
-    device: torch.device,
-    motion_scale: float = 2.0,        # Embedding-distance motion weight
-    eventness_scale: float = 2.0,     # Spike detection weight
-    persistence_scale: float = 1.0,   # Multi-frame persistence weight
-    max_ratio: float = 6.0,           # Safe cap: 95th percentile / median ≤ max_ratio
-) -> torch.Tensor:
-    """
-    Hybrid importance weighting (v2.0) - game-agnostic, robust.
-    
-    Combines:
-    1. Embedding-distance motion: L2 distance in embedding space (not token ID)
-       - Robust to codebook neighbor jitter
-       - Captures magnitude of visual change
-    
-    2. Eventness spike detection: sample-level motion spike vs recent history
-       - Upweights frames with unusual motion (ball fire, explosions, spawns)
-       - Helps model learn rare but critical transitions
-    
-    3. Persistence: tokens that move in multiple consecutive frames
-       - Distinguishes real movers (ball) from jitter
-       - Smooth decay to avoid abrupt weight changes
-    
-    4. Safe percentile capping: prevents extreme ratios that starve context
-       - Caps at max_ratio × median instead of hard max
-       - Preserves relative importance while preventing instability
-    
-    Returns: (B, N) weight tensor (mean ~1.0 per sample)
-    """
-    B, N = target_tokens.shape
-    T = history_tokens.shape[1]
-    
-    with torch.no_grad():
-        # === 1. Embedding-Distance Motion ===
-        # More robust than token-ID comparison (codebook neighbors have similar embeddings)
-        target_emb = token_embedding(target_tokens)           # (B, N, D)
-        prev_emb = token_embedding(history_tokens[:, -1])     # (B, N, D)
-        
-        # L2 distance in embedding space
-        motion_mag = torch.norm(target_emb - prev_emb, dim=-1)  # (B, N)
-        
-        # Robust normalize: divide by median (not mean) to reduce outlier sensitivity
-        motion_median = motion_mag.median(dim=1, keepdim=True).values.clamp(min=1e-6)
-        motion_norm = motion_mag / motion_median  # Relative motion magnitude
-        
-        # === 2. Eventness Spike Detection ===
-        # Detect frames with unusually high motion (ball launch, explosions, etc.)
-        sample_motion = motion_mag.mean(dim=1)  # (B,) - mean motion this frame
-        
-        if T >= 2:
-            # Compare to previous frame's motion
-            prev2_emb = token_embedding(history_tokens[:, -2])  # (B, N, D)
-            hist_motion_mag = torch.norm(prev_emb - prev2_emb, dim=-1)
-            hist_motion = hist_motion_mag.mean(dim=1)  # (B,)
-            
-            # Spike ratio: how much more motion than previous frame?
-            # High ratio = "something just happened" (fire, spawn, hit)
-            eventness = (sample_motion / (hist_motion + 1e-6)).clamp(min=0.5, max=3.0)
-            eventness = (eventness - 1.0)  # Center at 0 (1.0 = no change)
-        else:
-            eventness = torch.zeros(B, device=device)
-        
-        # Broadcast eventness to per-token (it's a sample-level boost)
-        eventness_weight = eventness.unsqueeze(1).expand(B, N)
-        
-        # === 3. Persistence (multi-frame motion consistency) ===
-        # Tokens that move in multiple consecutive frames = real movers (ball)
-        # Tokens that move once = jitter or occasional changes
-        if T >= 2:
-            persistence = torch.zeros(B, N, device=device)
-            prev_frame_emb = token_embedding(history_tokens[:, -1])
-            
-            for t in range(T - 2, -1, -1):  # Walk backwards through history
-                curr_frame_emb = token_embedding(history_tokens[:, t])
-                frame_motion = torch.norm(prev_frame_emb - curr_frame_emb, dim=-1)
-                
-                # Binary: did this position have significant motion?
-                moved = (frame_motion > motion_median * 0.5).float()
-                
-                # Decay older frames (recent motion matters more)
-                decay = 0.7 ** (T - 1 - t)
-                persistence += moved * decay
-                
-                prev_frame_emb = curr_frame_emb
-            
-            # Normalize persistence to [0, 1] range approximately
-            persistence = persistence / (T - 1)
-        else:
-            persistence = torch.zeros(B, N, device=device)
-        
-        # === Combine Signals ===
-        weights = (
-            1.0
-            + motion_scale * (motion_norm - 1.0).clamp(min=0)  # Only boost, don't penalize static
-            + eventness_scale * eventness_weight.clamp(min=0)  # Only boost on spikes
-            + persistence_scale * persistence
-        )
-        
-        # === Safe Percentile-Based Capping ===
-        # Instead of hard max, cap based on ratio to median
-        # This preserves relative importance while preventing extreme outliers
-        p50 = weights.median(dim=1, keepdim=True).values.clamp(min=0.5)
-        cap = p50 * max_ratio
-        # Use torch.clamp for mixed scalar/tensor bounds
-        weights = torch.clamp(weights, min=0.5)
-        weights = torch.minimum(weights, cap.expand_as(weights))
-        
-        # Normalize so mean=1 per sample (stable loss scale)
-        weights = weights / (weights.mean(dim=1, keepdim=True) + 1e-8)
-    
-    return weights
-
-
-# Legacy wrapper for backwards compatibility
-def compute_token_importance_weights(
-    target_tokens: torch.Tensor,
-    history_tokens: torch.Tensor,
-    device: torch.device,
-    base_weight: float = 1.0,
-    motion_weight: float = 2.0,
-    continuous_bonus: float = 0.5,
-    max_weight: float = 4.0,
-    token_embedding: torch.nn.Embedding = None,  # New: optional embedding for hybrid
-    use_hybrid: bool = True,  # New: use hybrid by default
-    motion_scale: float = 2.0,
-    eventness_scale: float = 2.0,
-    persistence_scale: float = 1.0,
-    max_ratio: float = 6.0,
-) -> torch.Tensor:
-    """
-    Token importance weighting - dispatches to hybrid (v2.0) or legacy (v1.x).
-    """
-    if use_hybrid and token_embedding is not None:
-        return compute_hybrid_importance_weights(
-            target_tokens, history_tokens, token_embedding, device,
-            motion_scale=motion_scale,
-            eventness_scale=eventness_scale,
-            persistence_scale=persistence_scale,
-            max_ratio=max_ratio,
-        )
-    
-    # Legacy v1.x behavior (for comparison)
-    B, N = target_tokens.shape
-    
-    with torch.no_grad():
-        prev_tokens = history_tokens[:, -1, :]
-        moved_now = (target_tokens != prev_tokens).float()
-        
-        if history_tokens.shape[1] >= 2:
-            prev2_tokens = history_tokens[:, -2, :]
-            moved_prev = (prev_tokens != prev2_tokens).float()
-            moved = torch.clamp(moved_now + moved_prev, 0, 1)
-            continuous_motion = moved_now * moved_prev
-        else:
-            moved = moved_now
-            continuous_motion = torch.zeros_like(moved_now)
-        
-        weights = base_weight + (motion_weight - base_weight) * moved + continuous_bonus * continuous_motion
-        weights = weights.clamp(min=base_weight, max=max_weight)
-        weights = weights / (weights.mean(dim=1, keepdim=True) + 1e-8)
-        
-    return weights
-
-
-# =============================================================================
-# Multi-Step Rollout Dataset
-# =============================================================================
-class MultiStepDataset(Dataset):
-    """
-    Dataset that returns K consecutive (history, action, target) tuples.
-    
-    v4 FIX: Correct frame/action alignment across episodes.
-    Uses episode_id to map action indices to frame indices.
-    
-    Used for multi-step rollout training where we:
-    1. Predict step 1 from real history
-    2. Feed prediction back as new history
-    3. Repeat for K steps, computing loss at each
-    """
-    
-    def __init__(
-        self,
-        tokens: np.ndarray,      # (N_frames,) or (N_frames, H, W) token indices
-        actions: np.ndarray,     # (N_actions,) action indices  
-        dones: np.ndarray,       # (N_actions,) episode terminations
-        episode_starts: np.ndarray,  # Not used in v4, kept for compatibility
-        history_len: int = 4,
-        rollout_steps: int = 4,  # K steps to unroll
-    ):
-        self.tokens = torch.from_numpy(tokens).long()
-        self.actions = torch.from_numpy(actions.astype(np.int64)).long()
-        self.dones = np.array(dones, dtype=bool)
-        self.history_len = history_len
-        self.rollout_steps = rollout_steps
-        self.token_shape = tokens.shape[1:] if tokens.ndim > 1 else ()
-        
-        n = len(self.actions)
-        n_frames = len(self.tokens)
-        n_episodes = int(self.dones.sum()) + 1  # +1 for the last incomplete episode
-        
-        # v2.1: Alignment assertion - verify frame/action/episode relationship
-        # Expected: frames include initial reset frame per episode
-        # So: n_frames = n_actions + n_episodes (one reset frame per episode)
-        expected_frames = n + n_episodes
-        if abs(n_frames - expected_frames) > n_episodes:  # Allow some slack
-            print(f"  [WARNING] Frame/action alignment may be off:")
-            print(f"    Frames: {n_frames}, Actions: {n}, Episodes: {n_episodes}")
-            print(f"    Expected frames ≈ {expected_frames} (actions + episodes)")
-            print(f"    Diff: {n_frames - expected_frames}")
-        
-        # v4 FIX: Compute episode_id for each action index
-        # episode_id[i] = number of dones before action i
-        self.episode_id = np.zeros(n, dtype=np.int64)
-        if n > 1:
-            self.episode_id[1:] = np.cumsum(self.dones[:-1].astype(np.int64))
-        
-        # v4 FIX: Map action index -> frame index
-        self.frame_index = np.arange(n, dtype=np.int64) + self.episode_id
-        
-        # v4 FIX: Episode start (in action-index space) for each action
-        episode_start_mask = np.concatenate([[True], self.dones[:-1]])
-        episode_starts_action = np.where(episode_start_mask)[0]
-        self.episode_start_action = episode_starts_action[self.episode_id]
-        
-        # Build valid indices
-        self.valid_indices = self._build_valid_indices()
-        print(f"  [MultiStepDataset v4] Valid rollout starts: {len(self.valid_indices)}")
-    
-    def _build_valid_indices(self) -> np.ndarray:
-        """
-        v4 FIX: Find valid indices with correct episode boundary handling.
-        
-        Need: history stays in-episode AND full rollout stays in-episode.
-        """
-        n = len(self.actions)
-        valid = []
-        
-        for i in range(n):
-            # Need rollout_steps actions starting at i
-            if i + self.rollout_steps > n:
-                continue
-            
-            # Check for dones in rollout window [i, i+rollout_steps-1]
-            # (the last action in window can be done, but not earlier ones)
-            if self.dones[i:i + self.rollout_steps - 1].any():
-                continue
-            
-            # History must stay in same episode (in action-index space)
-            history_start_action = i - self.history_len + 1
-            if history_start_action < self.episode_start_action[i]:
-                continue
-            
-            # Check last action in rollout is still same episode
-            last_action_idx = i + self.rollout_steps - 1
-            if self.episode_id[last_action_idx] != self.episode_id[i]:
-                continue
-            
-            # Need all target frames to exist
-            fi_last = self.frame_index[last_action_idx]
-            if fi_last + 1 >= len(self.tokens):
-                continue
-            
-            valid.append(i)
-        
-        return np.array(valid, dtype=np.int64)
-    
-    def __len__(self):
-        return len(self.valid_indices)
-    
-    def __getitem__(self, idx: int):
-        """
-        v4 FIX: Use frame_index for correct token indexing.
-        
-        Returns:
-            history: (history_len, H*W) initial history tokens
-            actions: (rollout_steps,) actions for each step
-            targets: (rollout_steps, H*W) target tokens for each step
-        """
-        i = self.valid_indices[idx]
-        fi = self.frame_index[i]
-        start_f = fi - self.history_len + 1
-        
-        # Initial history: tokens[start_f:fi+1] flattened
-        history = self.tokens[start_f:fi + 1]
-        if history.ndim > 1:
-            history = history.reshape(self.history_len, -1)  # (T, H*W) - reshape for non-contiguous
-        
-        # Actions for K steps (action indices are contiguous within episode)
-        actions = self.actions[i:i + self.rollout_steps]  # (K,)
-        
-        # Targets: tokens at frame_index[i]+1, frame_index[i+1]+1, etc.
-        # Since we're within same episode, frame indices are contiguous:
-        # fi+1, fi+2, ..., fi+K
-        targets = self.tokens[fi + 1:fi + 1 + self.rollout_steps]  # (K, H, W) or (K,)
-        if targets.ndim > 1:
-            targets = targets.reshape(self.rollout_steps, -1)  # (K, H*W) - reshape for non-contiguous
-        
-        return history, actions, targets
+from utils.importance_weights import compute_hybrid_importance_weights, compute_token_importance_weights
 
 
 def multistep_rollout_loss(
@@ -1128,8 +818,23 @@ def _plot_training(history, save_dir):
     epochs = list(range(1, len(history['train_loss']) + 1))
     xlim = (0, len(epochs) + 1)
     
+    # Detect if epoch 1 train is an outlier (fresh training from random init)
+    # Train metrics are averaged DURING epoch (including random init batches),
+    # while FastVal runs AFTER epoch completes. Skip epoch 1 train if outlier.
+    skip_first_train = False
+    if len(history['train_acc']) > 2 and history.get('fast_val_acc'):
+        train_e1 = history['train_acc'][0]
+        val_e1 = history['fast_val_acc'][0]
+        # If train is <50% of val at epoch 1, it's the random init outlier
+        if train_e1 < val_e1 * 0.6:
+            skip_first_train = True
+    
+    train_epochs = epochs[1:] if skip_first_train else epochs
+    train_loss = history['train_loss'][1:] if skip_first_train else history['train_loss']
+    train_acc = history['train_acc'][1:] if skip_first_train else history['train_acc']
+    
     # Loss plot
-    axes[0, 0].plot(epochs, history['train_loss'], 'b-o', label='Train', markersize=4)
+    axes[0, 0].plot(train_epochs, train_loss, 'b-o', label='Train' + (' (from e2)' if skip_first_train else ''), markersize=4)
     if history.get('fast_val_loss'):
         axes[0, 0].plot(epochs, history['fast_val_loss'], '-o', color='orange', label='FastVal', markersize=4)
     axes[0, 0].set_xlabel('Epoch')
@@ -1139,7 +844,7 @@ def _plot_training(history, save_dir):
     axes[0, 0].set_xlim(xlim)
     
     # Accuracy plot
-    axes[0, 1].plot(epochs, history['train_acc'], 'b-o', label='Train', markersize=4)
+    axes[0, 1].plot(train_epochs, train_acc, 'b-o', label='Train' + (' (from e2)' if skip_first_train else ''), markersize=4)
     if history.get('fast_val_acc'):
         axes[0, 1].plot(epochs, history['fast_val_acc'], '-o', color='orange', label='FastVal', markersize=4)
     axes[0, 1].set_xlabel('Epoch')
