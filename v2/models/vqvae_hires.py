@@ -1,7 +1,19 @@
 """
-High Resolution VQ-VAE (v2.8)
-=============================
+High Resolution VQ-VAE (v2.24)
+==============================
 Flexible token grid that supports non-square inputs.
+
+v2.24 improvements:
+- CRITICAL FIX: Wrap ALL EMA buffer updates in torch.no_grad()
+- Fixes linear CUDA memory leak caused by autograd graph retention
+- Affects: _ema_update(), _init_from_data(), _reset_dead_codes(), usage_counts
+- (Forum reference: VQ-VAE codebook EMA memory leak)
+
+v2.23 improvements:
+- Fixed implicit GPU->CPU syncs causing training slowdown (PyTorch forum issue)
+- Use Python bool for fast initialization check instead of tensor buffer
+- Use math.exp() instead of torch.exp(torch.tensor()) for stats
+- Explicit .item() calls to avoid hidden tensor comparisons
 
 v2.8 improvements:
 - U-Net skip connections (preserves fine details like ball!)
@@ -22,6 +34,8 @@ For aspect-ratio-preserved Atari (84x64):
 For legacy square input (64x64):
 - Input: 64x64 → Token grid: 16x16 = 256 tokens
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -242,6 +256,8 @@ class VectorQuantizerHiRes(nn.Module):
         self.register_buffer('ema_cluster_size', torch.zeros(n_embeddings))
         self.register_buffer('ema_embed_sum', self.embedding.weight.data.clone())
         self.register_buffer('initialized', torch.tensor(False))
+        # v2.23: Python bool for fast checking (avoids GPU->CPU sync every forward pass)
+        self._is_initialized = False
         # v2.1: track usage counts for histogram stats
         self.register_buffer('usage_counts', torch.zeros(n_embeddings))
         # v2.14: Reusable buffer for EMA update (prevents allocation every update)
@@ -252,7 +268,11 @@ class VectorQuantizerHiRes(nn.Module):
         z = z.permute(0, 2, 3, 1).contiguous()
         z_flat = z.view(-1, self.embedding_dim)
         
-        if self.training and not self.initialized:
+        # v2.23: Use Python bool to avoid GPU->CPU sync every forward pass
+        # Sync from tensor buffer if loading from checkpoint (one-time check)
+        if not self._is_initialized and self.initialized.item():
+            self._is_initialized = True
+        if self.training and not self._is_initialized:
             self._init_from_data(z_flat)
         
         # v2.6: Euclidean distance in FP32 to prevent winner-take-all
@@ -273,9 +293,12 @@ class VectorQuantizerHiRes(nn.Module):
             del z_flat_f32, emb_f32, distances
         
         if self.training:
-            self._ema_update(z_flat, indices)
-            # Update usage counts for stats
-            self.usage_counts.add_(torch.bincount(indices, minlength=self.n_embeddings).float())
+            # v2.24: Wrap ALL buffer updates in no_grad() to prevent autograd graph retention
+            # (Forum fix: EMA updates to registered buffers were causing linear memory leak)
+            with torch.no_grad():
+                self._ema_update(z_flat, indices)
+                # Update usage counts for stats
+                self.usage_counts.add_(torch.bincount(indices, minlength=self.n_embeddings).float())
         
         z_q = self.embedding(indices).view(z.shape)
         
@@ -301,58 +324,69 @@ class VectorQuantizerHiRes(nn.Module):
         
         v2.2 fix: Fill ALL codes from data (repeat-sample if needed).
         v2.3 fix: ALSO sync EMA buffers to prevent immediate corruption!
+        v2.24 fix: Wrap in no_grad() to prevent autograd graph retention.
         """
-        n_data = z_flat.shape[0]
-        device = z_flat.device
-        
-        # v2.9: K-means++ style initialization for diversity
-        # Instead of random sampling, iteratively pick points far from existing centers
-        z_flat_f32 = z_flat.float().detach()
-        
-        # Start with random first center
-        indices = [torch.randint(0, n_data, (1,), device=device).item()]
-        
-        for _ in range(min(self.n_embeddings, n_data) - 1):
-            # Compute distances to nearest existing center
-            centers = z_flat_f32[indices]  # (k, D)
-            # distances: (n_data, k) -> min over k -> (n_data,)
-            dists = torch.cdist(z_flat_f32, centers).min(dim=1).values
-            # Sample proportional to distance squared (k-means++ style)
-            probs = dists ** 2
-            probs = probs / probs.sum()
-            # Pick next center
-            next_idx = torch.multinomial(probs, 1).item()
-            indices.append(next_idx)
-        
-        chosen = z_flat_f32[indices]
-        n_chosen = len(chosen)
-        
-        # v2.9: Add small jitter to prevent identical codes
-        # Ensure minimum distance between all pairs
-        jitter_scale = 0.1
-        chosen = chosen + jitter_scale * torch.randn_like(chosen)
-        
-        self.embedding.weight.data[:n_chosen] = chosen
-        
-        # v2.2: Fill remainder by repeat-sampling (reduces dead-code churn)
-        if n_chosen < self.n_embeddings:
-            n_remaining = self.n_embeddings - n_chosen
-            repeat_idx = torch.randint(0, n_chosen, (n_remaining,), device=device)
-            self.embedding.weight.data[n_chosen:] = chosen[repeat_idx]
-            print(f"  Initialized codebook with k-means++: {n_chosen} diverse + {n_remaining} repeat")
-        else:
-            print(f"  Initialized codebook with k-means++ ({n_chosen} diverse centers)")
-        
-        # v2.3 CRITICAL FIX: Sync EMA buffers to match initialized embeddings!
-        # Without this, the first EMA update will corrupt the codebook with
-        # the old random ema_embed_sum values.
-        self.ema_embed_sum.copy_(self.embedding.weight.data)
-        # Initialize cluster sizes uniformly so codes don't appear "dead" immediately
-        self.ema_cluster_size.fill_(1.0)
-        
-        self.initialized.fill_(True)
+        # v2.24: All buffer updates must be in no_grad() to prevent memory leak
+        with torch.no_grad():
+            n_data = z_flat.shape[0]
+            device = z_flat.device
+            
+            # v2.9: K-means++ style initialization for diversity
+            # Instead of random sampling, iteratively pick points far from existing centers
+            z_flat_f32 = z_flat.float()
+            
+            # Start with random first center
+            indices = [torch.randint(0, n_data, (1,), device=device).item()]
+            
+            for _ in range(min(self.n_embeddings, n_data) - 1):
+                # Compute distances to nearest existing center
+                centers = z_flat_f32[indices]  # (k, D)
+                # distances: (n_data, k) -> min over k -> (n_data,)
+                dists = torch.cdist(z_flat_f32, centers).min(dim=1).values
+                # Sample proportional to distance squared (k-means++ style)
+                probs = dists ** 2
+                probs = probs / probs.sum()
+                # Pick next center
+                next_idx = torch.multinomial(probs, 1).item()
+                indices.append(next_idx)
+                # v2.15: Explicit cleanup to reduce peak memory during init
+                del centers, dists, probs
+            
+            chosen = z_flat_f32[indices]
+            n_chosen = len(chosen)
+            
+            # v2.9: Add small jitter to prevent identical codes
+            # Ensure minimum distance between all pairs
+            jitter_scale = 0.1
+            chosen = chosen + jitter_scale * torch.randn_like(chosen)
+            
+            self.embedding.weight.data[:n_chosen] = chosen
+            
+            # v2.2: Fill remainder by repeat-sampling (reduces dead-code churn)
+            if n_chosen < self.n_embeddings:
+                n_remaining = self.n_embeddings - n_chosen
+                repeat_idx = torch.randint(0, n_chosen, (n_remaining,), device=device)
+                self.embedding.weight.data[n_chosen:] = chosen[repeat_idx]
+                print(f"  Initialized codebook with k-means++: {n_chosen} diverse + {n_remaining} repeat")
+            else:
+                print(f"  Initialized codebook with k-means++ ({n_chosen} diverse centers)")
+            
+            # v2.3 CRITICAL FIX: Sync EMA buffers to match initialized embeddings!
+            # Without this, the first EMA update will corrupt the codebook with
+            # the old random ema_embed_sum values.
+            self.ema_embed_sum.copy_(self.embedding.weight.data)
+            # Initialize cluster sizes uniformly so codes don't appear "dead" immediately
+            self.ema_cluster_size.fill_(1.0)
+            
+            self.initialized.fill_(True)
+            self._is_initialized = True  # v2.23: Sync Python bool
     
     def _ema_update(self, z_flat: torch.Tensor, indices: torch.Tensor):
+        """
+        v2.24 fix: EMA updates to registered buffers MUST be in no_grad()!
+        Without this, the autograd graph is retained, causing linear memory leak.
+        (See PyTorch forum: VQ-VAE codebook EMA memory leak)
+        """
         if not hasattr(self, '_update_count'):
             self._update_count = 0
         self._update_count += 1
@@ -361,27 +395,30 @@ class VectorQuantizerHiRes(nn.Module):
         if self.ema_update_every > 1 and self._update_count % self.ema_update_every != 0:
             return
         
-        # v2.6: Use bincount + index_add_ instead of one_hot (much cheaper!)
-        # This is O(N) instead of O(N*K) memory
-        cluster_size = torch.bincount(indices, minlength=self.n_embeddings).float()
-        self.ema_cluster_size.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
-        
-        # v2.14: Reuse buffer instead of allocating new tensor every update
-        # Fallback for old checkpoints that don't have this buffer
-        if not hasattr(self, '_ema_embed_sum_buffer') or self._ema_embed_sum_buffer is None:
-            self.register_buffer('_ema_embed_sum_buffer', torch.zeros_like(self.ema_embed_sum))
-        self._ema_embed_sum_buffer.zero_()
-        self._ema_embed_sum_buffer.index_add_(0, indices, z_flat.float())
-        self.ema_embed_sum.mul_(self.ema_decay).add_(self._ema_embed_sum_buffer, alpha=1 - self.ema_decay)
-        
-        n = self.ema_cluster_size.sum()
-        cluster_size_normalized = (
-            (self.ema_cluster_size + self.epsilon) /
-            (n + self.n_embeddings * self.epsilon) * n
-        )
-        
-        new_embed = self.ema_embed_sum / cluster_size_normalized.unsqueeze(1)
-        self.embedding.weight.data.copy_(new_embed.float())
+        # v2.24: CRITICAL - wrap all buffer updates in no_grad() to prevent memory leak
+        with torch.no_grad():
+            # v2.6: Use bincount + index_add_ instead of one_hot (much cheaper!)
+            # This is O(N) instead of O(N*K) memory
+            cluster_size = torch.bincount(indices, minlength=self.n_embeddings).float()
+            self.ema_cluster_size.mul_(self.ema_decay).add_(cluster_size, alpha=1 - self.ema_decay)
+            
+            # v2.14: Reuse buffer instead of allocating new tensor every update
+            # Fallback for old checkpoints that don't have this buffer
+            if not hasattr(self, '_ema_embed_sum_buffer') or self._ema_embed_sum_buffer is None:
+                self.register_buffer('_ema_embed_sum_buffer', torch.zeros_like(self.ema_embed_sum))
+            self._ema_embed_sum_buffer.zero_()
+            self._ema_embed_sum_buffer.index_add_(0, indices, z_flat.float())
+            self.ema_embed_sum.mul_(self.ema_decay).add_(self._ema_embed_sum_buffer, alpha=1 - self.ema_decay)
+            
+            n = self.ema_cluster_size.sum()
+            cluster_size_normalized = (
+                (self.ema_cluster_size + self.epsilon) /
+                (n + self.n_embeddings * self.epsilon) * n
+            )
+            
+            # v2.15: In-place ops to avoid 512KB allocation per update
+            self.embedding.weight.data.copy_(self.ema_embed_sum)
+            self.embedding.weight.data.div_(cluster_size_normalized.unsqueeze(1))
         
         # v2.11: Dead code reset re-enabled to combat constant dead count
         if self._update_count % self.reset_every_n_batches == 0:
@@ -394,35 +431,40 @@ class VectorQuantizerHiRes(nn.Module):
         v2.1 had a bug: wouldn't reset if >50% were dead, which is exactly
         when you NEED to reset! Now we always reset dead codes, but limit
         how many per batch to avoid instability.
+        
+        v2.24 fix: Wrap in no_grad() to prevent autograd graph retention.
         """
         if z_flat.shape[0] == 0:
             return
-            
-        # Normalize cluster sizes to get usage percentages
-        total = self.ema_cluster_size.sum()
-        if total == 0:
-            return
-        usage_pct = self.ema_cluster_size / total
         
-        # Find dead codes (below threshold)
-        dead_mask = usage_pct < self.dead_code_threshold
-        n_dead = dead_mask.sum().item()
-        
-        # v2.3: Always reset dead codes, but limit to avoid instability
-        # (removed the "don't reset if >50% dead" condition - that was the bug!)
-        if n_dead > 0:
-            # v2.4: Reduced from 64 to 16 to avoid loss spikes
-            max_reset_per_batch = min(16, z_flat.shape[0])
-            n_reset = min(int(n_dead), max_reset_per_batch)
-            random_idx = torch.randperm(z_flat.shape[0], device=z_flat.device)[:n_reset]
+        # v2.24: All buffer updates must be in no_grad() to prevent memory leak
+        with torch.no_grad():
+            # Normalize cluster sizes to get usage percentages
+            # v2.23: Use .item() to avoid implicit GPU->CPU sync from tensor comparison
+            total = self.ema_cluster_size.sum()
+            if total.item() == 0:
+                return
+            usage_pct = self.ema_cluster_size / total
             
-            # Get indices of dead codes
-            dead_indices = torch.where(dead_mask)[0][:n_reset]
+            # Find dead codes (below threshold)
+            dead_mask = usage_pct < self.dead_code_threshold
+            n_dead = dead_mask.sum().item()
             
-            self.embedding.weight.data[dead_indices] = z_flat[random_idx].detach().float()
-            # Reset EMA stats for these codes
-            self.ema_cluster_size[dead_indices] = 1.0
-            self.ema_embed_sum[dead_indices] = z_flat[random_idx].detach().float()
+            # v2.3: Always reset dead codes, but limit to avoid instability
+            # (removed the "don't reset if >50% dead" condition - that was the bug!)
+            if n_dead > 0:
+                # v2.4: Reduced from 64 to 16 to avoid loss spikes
+                max_reset_per_batch = min(16, z_flat.shape[0])
+                n_reset = min(int(n_dead), max_reset_per_batch)
+                random_idx = torch.randperm(z_flat.shape[0], device=z_flat.device)[:n_reset]
+                
+                # Get indices of dead codes
+                dead_indices = torch.where(dead_mask)[0][:n_reset]
+                
+                self.embedding.weight.data[dead_indices] = z_flat[random_idx].float()
+                # Reset EMA stats for these codes
+                self.ema_cluster_size[dead_indices] = 1.0
+                self.ema_embed_sum[dead_indices] = z_flat[random_idx].float()
     
     def get_batch_stats(self, indices: torch.Tensor) -> dict:
         """
@@ -431,7 +473,8 @@ class VectorQuantizerHiRes(nn.Module):
         Use this to monitor per-batch health during training.
         """
         counts = torch.bincount(indices.flatten(), minlength=self.n_embeddings).float()
-        total = counts.sum()
+        # v2.23: Use .item() to avoid implicit GPU->CPU sync from tensor comparison
+        total = counts.sum().item()
         
         if total == 0:
             return {'batch_usage': 0.0, 'batch_perplexity': 0.0}
@@ -441,7 +484,8 @@ class VectorQuantizerHiRes(nn.Module):
         
         usage = (counts > 0).float().mean().item() * 100
         entropy = -torch.sum(probs_nonzero * torch.log(probs_nonzero + 1e-10)).item()
-        perplexity = float(torch.exp(torch.tensor(entropy)))  # Avoid extra .item() call
+        # v2.23: Use math.exp instead of torch.exp(torch.tensor()) to avoid unnecessary allocation
+        perplexity = math.exp(entropy)
         
         return {
             'batch_usage': usage,

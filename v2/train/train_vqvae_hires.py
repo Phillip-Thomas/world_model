@@ -1,16 +1,28 @@
 """
-VQ-VAE Training Script v2.13 (Performance Optimized)
-- Fix: Reduce tqdm update frequency to avoid GPU sync every batch
-- Fix: Increase stats_log_every to reduce sync overhead
-- Fix: Remove torch.cuda.empty_cache() (causes allocator churn)
-- Fix: GPU-only validation stats (no .cpu() per batch)
-- Fix: Disable GC during training to prevent random pauses
+VQ-VAE Training Script v2.14 (Run Directory Support)
+=====================================================
+Adds timestamped run directories for experiment tracking.
+
+v2.14 improvements:
+- Timestamped run directories (like world model training)
+- Config saving to JSON for reproducibility
+- Training stats logging to text file
+- --from-run and --from-checkpoint for easy resuming
+- Better checkpoint organization (best, latest, periodic)
+
+v2.13 performance optimizations:
+- Reduce tqdm update frequency to avoid GPU sync every batch
+- Increase stats_log_every to reduce sync overhead
+- GPU-only validation stats (no .cpu() per batch)
 """
 
 import sys
 import os
 import gc
+import glob
+import re
 import itertools
+from datetime import datetime
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -23,6 +35,83 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 from models.vqvae_hires import VQVAEHiRes
+from config.defaults import VQVAEConfig
+
+
+# =============================================================================
+# Run Directory Management
+# =============================================================================
+
+
+def resolve_resume_path(from_run: str = None, from_checkpoint: str = None, base_dir: str = "checkpoints/v2/atari") -> str:
+    """
+    Resolve checkpoint path for resuming training.
+    
+    Args:
+        from_run: Run directory name (e.g., "20260110_111307") or "latest"
+        from_checkpoint: Checkpoint name (e.g., "best", "epoch20") or None for latest
+        base_dir: Base directory containing vqvae_runs folder
+        
+    Returns:
+        Full path to checkpoint file, or None if from_run not specified
+    """
+    if not from_run:
+        return None
+    
+    # Build runs directory from base_dir
+    vqvae_runs_dir = os.path.join(base_dir, "vqvae_runs")
+    
+    # Find run directory
+    if from_run == "latest":
+        if not os.path.exists(vqvae_runs_dir):
+            raise FileNotFoundError(f"No runs directory found: {vqvae_runs_dir}")
+        run_dirs = [d for d in os.listdir(vqvae_runs_dir) if os.path.isdir(os.path.join(vqvae_runs_dir, d))]
+        if not run_dirs:
+            raise FileNotFoundError(f"No run directories found in: {vqvae_runs_dir}")
+        run_dirs.sort(reverse=True)  # Timestamp format sorts correctly
+        run_name = run_dirs[0]
+    else:
+        run_name = from_run
+    
+    run_path = os.path.join(vqvae_runs_dir, run_name)
+    if not os.path.exists(run_path):
+        raise FileNotFoundError(f"Run directory not found: {run_path}")
+    
+    # Find checkpoint
+    if from_checkpoint:
+        candidates = [
+            f"vqvae_{from_checkpoint}.pt",       # best checkpoint
+            f"vqvae_epoch{from_checkpoint}.pt",  # epoch checkpoints
+            f"{from_checkpoint}.pt",             # direct name
+        ]
+        for ckpt_name in candidates:
+            ckpt_path = os.path.join(run_path, ckpt_name)
+            if os.path.exists(ckpt_path):
+                return ckpt_path
+        raise FileNotFoundError(f"Checkpoint not found: {from_checkpoint} in {run_path}\n  Tried: {candidates}")
+    else:
+        # Find latest checkpoint by epoch number
+        checkpoints = glob.glob(os.path.join(run_path, "vqvae*.pt"))
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoints found in: {run_path}")
+        
+        best_ckpt = None
+        best_epoch = -1
+        for ckpt in checkpoints:
+            basename = os.path.basename(ckpt)
+            match = re.search(r'epoch(\d+)\.pt$', basename)
+            if match:
+                epoch = int(match.group(1))
+                if epoch > best_epoch:
+                    best_epoch = epoch
+                    best_ckpt = ckpt
+            elif basename == "vqvae_latest.pt" and best_epoch < 0:
+                best_ckpt = ckpt
+                best_epoch = 0
+        
+        if best_ckpt is None:
+            raise FileNotFoundError(f"No valid checkpoint found in: {run_path}")
+        return best_ckpt
 
 # Hoisted constants for sobel_edge_loss (CPU templates - will be cached on GPU)
 _SOBEL_X_CPU = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
@@ -129,32 +218,66 @@ def episode_based_split(episode_starts: np.ndarray, total_frames: int, val_ratio
 
 def train_vqvae_hires(
     data_path: str = "checkpoints/v2/atari/atari_game_data.npz",
-    checkpoint_dir: str = "checkpoints/v2/atari",
+    base_dir: str = "checkpoints/v2/atari",
     n_epochs: int = 25,
     batch_size: int = 128,
     learning_rate: float = 3e-4,
     beta: float = 0.1,  # VQ loss weight (lowered to prevent collapse)
     edge_weight: float = 0.05,
-    n_embeddings: int = 32,
+    n_embeddings: int = 64,  # Codebook size (64 works well for Atari)
+    hidden_channels: int = 64,  # Encoder/decoder capacity (try 96 for more detail)
     ema_decay: float = 0.95,  # Per-update decay (with ema_update_every=10)
     ema_update_every: int = 10,
-    resume: str = None,
+    resume: bool = False,
+    resume_path: str = None,  # Explicit path to resume from
     workers: int = 0,
     max_batches_per_epoch: int = None,
     max_frames: int = 200000,  # Limit frames loaded to avoid OOM
 ):
     """
-    Train VQ-VAE v2.13 with performance optimizations.
+    Train VQ-VAE v2.14 with run directory support.
     
-    Performance fixes:
+    Features:
+    - Timestamped run directories for experiment tracking
+    - Config saving for reproducibility
+    - Training stats logging to text file
+    - Better checkpoint organization
+    
+    Performance optimizations:
     - Update tqdm every 20 batches (not every batch)
     - Compute detailed stats every 500 batches (not 50)
-    - Remove torch.cuda.empty_cache()
     - GPU-only validation histogram
-    - Disable GC during training
     """
+    # Change to project root for consistent paths
+    os.chdir(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+    
+    # Create timestamped run directory (uses base_dir, not hardcoded atari path)
+    os.makedirs(base_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    vqvae_runs_dir = os.path.join(base_dir, "vqvae_runs")
+    run_dir = os.path.join(vqvae_runs_dir, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    print(f"Run directory: {run_dir}")
+    
+    # Create and save config
+    run_config = VQVAEConfig()
+    run_config.timestamp = timestamp
+    run_config.run_dir = run_dir
+    run_config.data_path = data_path
+    run_config.training.n_epochs = n_epochs
+    run_config.training.batch_size = batch_size
+    run_config.training.learning_rate = learning_rate
+    run_config.training.beta = beta
+    run_config.training.edge_weight = edge_weight
+    run_config.training.ema_decay = ema_decay
+    run_config.training.ema_update_every = ema_update_every
+    run_config.training.max_batches = max_batches_per_epoch or 0
+    run_config.training.max_frames = max_frames
+    run_config.training.workers = workers
+    run_config.model.n_embeddings = n_embeddings
     
     # v2.22: Limit GPU memory to prevent spilling into shared memory
     if device.type == "cuda":
@@ -163,6 +286,8 @@ def train_vqvae_hires(
         # Set memory fraction to prevent shared memory usage
         torch.cuda.set_per_process_memory_fraction(0.85, 0)
         print(f"  GPU memory limit: {total_mem * 0.85 / 1e9:.1f}GB (85% of {total_mem / 1e9:.1f}GB)")
+    
+    checkpoint_path = Path(run_dir)
     
     # Load data
     print("\nLoading game data...")
@@ -229,10 +354,10 @@ def train_vqvae_hires(
     )
     
     # Create model
-    print(f"\nCreating VQ-VAE v2.1 for {input_h}x{input_w} input...")
+    print(f"\nCreating VQ-VAE v2.1 for {input_h}x{input_w} input (hidden={hidden_channels})...")
     model = VQVAEHiRes(
         in_channels=3,
-        hidden_channels=64,
+        hidden_channels=hidden_channels,
         latent_channels=256,
         n_embeddings=n_embeddings,
         input_size=(input_h, input_w),
@@ -279,24 +404,54 @@ def train_vqvae_hires(
         return h
     
     # Resume from checkpoint
-    if resume and os.path.exists(resume):
-        print(f"\nResuming from {resume}...")
-        checkpoint = torch.load(resume, map_location=device, weights_only=False)
-        # v2.14: Use strict=False to allow new buffers that old checkpoints don't have
-        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
-        if 'optimizer_state_dict' in checkpoint:
-            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        if 'scaler_state_dict' in checkpoint:
-            scaler.load_state_dict(checkpoint['scaler_state_dict'])
-        if 'epoch' in checkpoint:
-            start_epoch = checkpoint['epoch']
-        if 'best_val_loss' in checkpoint:
-            best_val_loss = checkpoint['best_val_loss']
-        if 'history' in checkpoint:
-            history = _ensure_history_keys(checkpoint['history'])
-        print(f"  Resumed at epoch {start_epoch + 1}, best_val_loss={best_val_loss:.4f}")
+    resumed_from_path = None
+    if resume:
+        # Use explicit resume_path if provided
+        # Try new naming first, fall back to legacy
+        if resume_path:
+            ckpt_path = resume_path
+        else:
+            ckpt_path = os.path.join(base_dir, "vqvae_hires.pt")
+            if not os.path.exists(ckpt_path):
+                ckpt_path = os.path.join(base_dir, "atari_vqvae_hires.pt")  # Legacy
+        
+        if os.path.exists(ckpt_path):
+            print(f"\nResuming from {ckpt_path}...")
+            checkpoint = torch.load(ckpt_path, map_location=device, weights_only=False)
+            # v2.14: Use strict=False to allow new buffers that old checkpoints don't have
+            model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            if 'scheduler_state_dict' in checkpoint:
+                scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            if 'scaler_state_dict' in checkpoint:
+                scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            if 'epoch' in checkpoint:
+                start_epoch = checkpoint['epoch']
+            if 'best_val_loss' in checkpoint:
+                best_val_loss = checkpoint['best_val_loss']
+            if 'history' in checkpoint:
+                history = _ensure_history_keys(checkpoint['history'])
+            resumed_from_path = ckpt_path
+            print(f"  Resumed at epoch {start_epoch + 1}, best_val_loss={best_val_loss:.4f}")
+        else:
+            print(f"  No checkpoint found at {ckpt_path}, starting fresh")
+    
+    # Update config with detected dimensions and save
+    run_config.model.input_h = input_h
+    run_config.model.input_w = input_w
+    run_config.save(os.path.join(run_dir, "config.json"))
+    print(f"  Config saved to {run_dir}/config.json")
+    
+    # Write session header to stats file
+    _write_session_header(
+        save_dir=run_dir,
+        start_epoch=start_epoch + 1,
+        end_epoch=start_epoch + n_epochs,
+        resumed_from=resumed_from_path,
+        resumed_epoch=start_epoch if resumed_from_path else None,
+        resumed_loss=best_val_loss if resumed_from_path else None
+    )
     
     # Effective batches per epoch
     effective_batches = max_batches_per_epoch if max_batches_per_epoch else len(train_loader)
@@ -311,9 +466,6 @@ def train_vqvae_hires(
     print(f"  Batch size: {batch_size}, Batches/epoch: {effective_batches}")
     print(f"  PERF: tqdm update every 20, stats every 500, no empty_cache")
     print("=" * 60)
-    
-    checkpoint_path = Path(checkpoint_dir)
-    checkpoint_path.mkdir(parents=True, exist_ok=True)
     
     # Performance settings
     tqdm_update_every = 20  # Only sync/update tqdm every N batches
@@ -470,6 +622,7 @@ def train_vqvae_hires(
         # Get EMA dead codes count (extract Python int immediately)
         ema_dead = model.get_codebook_stats().get('ema_dead_codes', 0)
         
+        is_best = avg_val_loss < best_val_loss
         print(f"\n  Epoch {epoch+1}: loss={avg_val_loss:.4f}, L1={avg_train_l1:.4f}, "
               f"usage={epoch_usage:.1f}%, pplx={int(epoch_perplexity)}, "
               f"dead={int(epoch_dead)}, ema_dead={ema_dead}")
@@ -480,9 +633,21 @@ def train_vqvae_hires(
         history['usage'].append(epoch_usage)
         history['perplexity'].append(epoch_perplexity)
         
+        # Write epoch stats to text file
+        epoch_stats = {
+            'train_loss': avg_train_loss,
+            'val_loss': avg_val_loss,
+            'usage': epoch_usage,
+            'perplexity': epoch_perplexity,
+            'dead_codes': int(epoch_dead),
+            'ema_dead': ema_dead,
+        }
+        _write_epoch_stats(epoch + 1, epoch_stats, run_dir, is_best=is_best)
+        
         # Save best model
-        if avg_val_loss < best_val_loss:
+        if is_best:
             best_val_loss = avg_val_loss
+            # Save to run directory
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
@@ -494,9 +659,38 @@ def train_vqvae_hires(
                 'codebook_usage': epoch_usage,
                 'perplexity': epoch_perplexity,
                 'n_embeddings': n_embeddings,
+                'hidden_channels': hidden_channels,
+                'input_h': input_h,
+                'input_w': input_w,
                 'history': history,
-            }, checkpoint_path / "atari_vqvae_hires.pt")
+            }, checkpoint_path / "vqvae_best.pt")
+            # Also save to base_dir for easy access by world model
+            torch.save({
+                'model_state_dict': model.state_dict(),
+                'epoch': epoch + 1,
+                'val_loss': avg_val_loss,
+                'n_embeddings': n_embeddings,
+                'hidden_channels': hidden_channels,
+                'input_h': input_h,
+                'input_w': input_w,
+            }, os.path.join(base_dir, "vqvae_hires.pt"))
             print(f"  * New best model saved!")
+        
+        # Always save latest (for resuming)
+        torch.save({
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'epoch': epoch + 1,
+            'val_loss': avg_val_loss,
+            'best_val_loss': best_val_loss,
+            'n_embeddings': n_embeddings,
+            'hidden_channels': hidden_channels,
+            'input_h': input_h,
+            'input_w': input_w,
+            'history': history,
+        }, checkpoint_path / "vqvae_latest.pt")
         
         # Periodic checkpoint every 5 epochs
         if (epoch + 1) % 5 == 0:
@@ -509,9 +703,12 @@ def train_vqvae_hires(
                 'val_loss': avg_val_loss,
                 'best_val_loss': best_val_loss,
                 'n_embeddings': n_embeddings,
+                'hidden_channels': hidden_channels,
+                'input_h': input_h,
+                'input_w': input_w,
                 'history': history,
-            }, checkpoint_path / f"atari_vqvae_hires_epoch{epoch+1}.pt")
-            print(f"  Checkpoint saved (epoch {epoch+1})")
+            }, checkpoint_path / f"vqvae_epoch{epoch+1}.pt")
+            print(f"  Periodic checkpoint saved (epoch {epoch+1})")
         
         # v2.22: Aggressive cleanup after checkpoint saves to prevent memory buildup
         # torch.save() creates copies of state_dicts that need to be freed
@@ -525,10 +722,51 @@ def train_vqvae_hires(
     print("\n" + "=" * 60)
     print("Training complete!")
     print(f"  Best val loss: {best_val_loss:.4f}")
-    print(f"  Model saved to: {checkpoint_path / 'atari_vqvae_hires.pt'}")
+    print(f"  Run directory: {run_dir}")
+    print(f"  Best model:    {checkpoint_path / 'vqvae_best.pt'}")
+    print(f"  Latest:        {checkpoint_path / 'vqvae_latest.pt'}")
+    print(f"  Also saved to: {base_dir}/vqvae_hires.pt (for world model)")
     print("=" * 60)
     
     return model
+
+
+def _write_session_header(save_dir: str, start_epoch: int, end_epoch: int, 
+                          resumed_from: str = None, resumed_epoch: int = None,
+                          resumed_loss: float = None):
+    """Write a session header to the stats file when training starts/resumes."""
+    stats_file = os.path.join(save_dir, "training_stats.txt")
+    
+    with open(stats_file, 'a') as f:
+        f.write("\n" + "=" * 80 + "\n")
+        f.write(f"Training Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        if resumed_from:
+            f.write(f"  RESUMED FROM: {resumed_from}\n")
+            f.write(f"  Resume Epoch: {resumed_epoch}, Loss: {resumed_loss:.4f}\n")
+        else:
+            f.write("  NEW TRAINING RUN\n")
+        f.write(f"  Epochs: {start_epoch} -> {end_epoch}\n")
+        f.write("=" * 80 + "\n\n")
+
+
+def _write_epoch_stats(epoch: int, stats: dict, save_dir: str, is_best: bool = False):
+    """Write epoch stats to a text file for easy review."""
+    stats_file = os.path.join(save_dir, "training_stats.txt")
+    
+    # Create header if file doesn't exist
+    if not os.path.exists(stats_file):
+        with open(stats_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("VQ-VAE Training Statistics Log\n")
+            f.write("=" * 80 + "\n\n")
+    
+    with open(stats_file, 'a') as f:
+        best_marker = " *BEST*" if is_best else ""
+        f.write(f"Epoch {epoch}{best_marker}\n")
+        f.write(f"  Train Loss: {stats['train_loss']:.4f}  |  Val Loss: {stats['val_loss']:.4f}\n")
+        f.write(f"  Codebook Usage: {stats['usage']:.1f}%  |  Perplexity: {stats['perplexity']:.1f}\n")
+        f.write(f"  Dead Codes: {stats['dead_codes']}  |  EMA Dead: {stats['ema_dead']}\n")
+        f.write("-" * 40 + "\n")
 
 
 def _plot_training(history: dict, checkpoint_path: Path, n_embeddings: int):
@@ -572,37 +810,82 @@ def _plot_training(history: dict, checkpoint_path: Path, n_embeddings: int):
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Train VQ-VAE v2.13")
-    parser.add_argument("--data", type=str, default="checkpoints/v2/atari/atari_game_data.npz")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/v2/atari")
-    parser.add_argument("--epochs", type=int, default=25)
-    parser.add_argument("--batch-size", type=int, default=128)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--beta", type=float, default=0.1)
-    parser.add_argument("--edge-weight", type=float, default=0.05)
-    parser.add_argument("--n-embeddings", type=int, default=32)
-    parser.add_argument("--ema-decay", type=float, default=0.95)
-    parser.add_argument("--ema-update-every", type=int, default=10)
-    parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--workers", type=int, default=0)
-    parser.add_argument("--max-batches", type=int, default=None)
-    parser.add_argument("--max-frames", type=int, default=200000, help="Max frames to load (avoids OOM)")
+    parser = argparse.ArgumentParser(
+        description="Train VQ-VAE v2.14 with run directory support",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    
+    # Data and output paths
+    parser.add_argument("--data", type=str, default="checkpoints/v2/atari/atari_game_data.npz",
+                        help="Path to game data file")
+    parser.add_argument("--base-dir", type=str, default="checkpoints/v2/atari",
+                        help="Base directory for shared assets")
+    
+    # Training hyperparameters
+    parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")
+    parser.add_argument("--batch-size", type=int, default=None, help="Batch size")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate")
+    parser.add_argument("--beta", type=float, default=None, help="VQ loss weight")
+    parser.add_argument("--edge-weight", type=float, default=None, help="Edge loss weight")
+    
+    # Model architecture
+    parser.add_argument("--n-embeddings", type=int, default=None, help="Codebook size")
+    parser.add_argument("--hidden-channels", type=int, default=None, help="Encoder/decoder hidden channels (default: 64, try 96 for more detail)")
+    
+    # EMA settings
+    parser.add_argument("--ema-decay", type=float, default=None, help="EMA decay rate")
+    parser.add_argument("--ema-update-every", type=int, default=None, help="EMA update frequency")
+    
+    # Resume functionality
+    parser.add_argument("--resume", action="store_true", help="Resume from checkpoint")
+    parser.add_argument("--from-run", type=str, default=None,
+                        help='Run directory to resume from (e.g., "20260110_111307" or "latest")')
+    parser.add_argument("--from-checkpoint", type=str, default=None,
+                        help='Checkpoint within run (e.g., "best", "epoch20"). Default: latest')
+    
+    # Performance settings
+    parser.add_argument("--workers", type=int, default=None, help="DataLoader workers")
+    parser.add_argument("--max-batches", type=int, default=None, help="Max batches per epoch (0=all)")
+    parser.add_argument("--max-frames", type=int, default=None, help="Max frames to load")
     
     args = parser.parse_args()
     
+    # Load defaults, then override with CLI args
+    config = VQVAEConfig()
+    config.update_from_args(args)
+    
+    # Resolve resume path if --from-run specified
+    resume_path = None
+    if args.from_run:
+        args.resume = True  # Automatically enable resume if --from-run specified
+        resume_path = resolve_resume_path(args.from_run, args.from_checkpoint, args.base_dir)
+        print(f"\n  Resume from: {resume_path}")
+    
+    # Print effective config
+    print("\n" + "=" * 60)
+    print("Effective Configuration (defaults + CLI overrides)")
+    print("=" * 60)
+    print(f"  Training: epochs={config.training.n_epochs}, batch={config.training.batch_size}, lr={config.training.learning_rate}")
+    print(f"  Loss: beta={config.training.beta}, edge_weight={config.training.edge_weight}")
+    print(f"  Model: n_embeddings={config.model.n_embeddings}, hidden_channels={config.model.hidden_channels}")
+    print(f"  EMA: decay={config.training.ema_decay}, update_every={config.training.ema_update_every}")
+    print("=" * 60 + "\n")
+    
     train_vqvae_hires(
         data_path=args.data,
-        checkpoint_dir=args.checkpoint_dir,
-        n_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        beta=args.beta,
-        edge_weight=args.edge_weight,
-        n_embeddings=args.n_embeddings,
-        ema_decay=args.ema_decay,
-        ema_update_every=args.ema_update_every,
+        base_dir=args.base_dir,
+        n_epochs=config.training.n_epochs,
+        batch_size=config.training.batch_size,
+        learning_rate=config.training.learning_rate,
+        beta=config.training.beta,
+        edge_weight=config.training.edge_weight,
+        n_embeddings=config.model.n_embeddings,
+        hidden_channels=config.model.hidden_channels,
+        ema_decay=config.training.ema_decay,
+        ema_update_every=config.training.ema_update_every,
         resume=args.resume,
-        workers=args.workers,
-        max_batches_per_epoch=args.max_batches,
-        max_frames=args.max_frames,
+        resume_path=resume_path,
+        workers=config.training.workers,
+        max_batches_per_epoch=config.training.max_batches if config.training.max_batches > 0 else None,
+        max_frames=config.training.max_frames,
     )

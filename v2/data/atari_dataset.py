@@ -176,13 +176,16 @@ class AtariCollector:
         Select action with diversity guarantees.
         
         v3: State-aware FIRE - force FIRE for first few steps after reset.
+        v4: Game-agnostic action selection (works for any number of actions).
         """
         if self._action_counts is None:
             self._action_counts = np.zeros(n_actions)
         
         # v3: Force FIRE for first few steps after reset/life loss
+        # FIRE is typically action 1 in most Atari games
         if (self.config.fire_until_ball_moves and 
-            self._steps_since_reset < self.config.fire_steps_after_reset):
+            self._steps_since_reset < self.config.fire_steps_after_reset and
+            n_actions > 1):
             self._steps_since_reset += 1
             self._action_counts[1] += 1  # FIRE = 1
             return 1
@@ -197,13 +200,24 @@ class AtariCollector:
             self._action_counts[action] += 1
             return action
         
-        # Use custom weights or default (v3: very low FIRE after ball launched)
+        # Use custom weights or generate game-agnostic defaults
         if self.config.action_weights is not None:
             probs = np.array(self.config.action_weights)
         else:
-            # v3: After ball launched, minimal FIRE probability
-            # [NOOP, FIRE, RIGHT, LEFT]
-            probs = np.array([0.05, 0.01, 0.47, 0.47])
+            # v4: Game-agnostic action selection
+            # - Action 0 (NOOP): low probability (5%)
+            # - Action 1 (FIRE): very low after launch (1%)
+            # - All other actions: equal split of remaining probability
+            probs = np.ones(n_actions)
+            if n_actions > 0:
+                probs[0] = 0.05  # NOOP
+            if n_actions > 1:
+                probs[1] = 0.01  # FIRE (after ball launched)
+            if n_actions > 2:
+                # Distribute remaining probability equally among movement actions
+                remaining_prob = 1.0 - 0.05 - 0.01
+                per_action = remaining_prob / (n_actions - 2)
+                probs[2:] = per_action
         
         probs = probs / probs.sum()
         action = np.random.choice(n_actions, p=probs)

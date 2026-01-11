@@ -171,16 +171,19 @@ def multistep_rollout_loss(
     return total_loss, step_accs
 
 
-RUNS_DIR = "checkpoints/v2/atari/runs"
+# Default runs directory (can be overridden by base_dir parameter)
+DEFAULT_RUNS_DIR = "checkpoints/v2/atari/runs"
 
 
-def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> str:
+def resolve_resume_path(from_run: str = None, from_checkpoint: str = None, 
+                        runs_dir: str = None) -> str:
     """
     Resolve checkpoint path for resuming training.
     
     Args:
         from_run: Run directory name (e.g., "20260110_111307") or "latest"
         from_checkpoint: Checkpoint name (e.g., "best", "epoch240") or None for latest
+        runs_dir: Directory containing run folders (default: DEFAULT_RUNS_DIR)
         
     Returns:
         Full path to checkpoint file, or None if from_run not specified
@@ -188,17 +191,21 @@ def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> st
     if not from_run:
         return None
     
+    runs_dir = runs_dir or DEFAULT_RUNS_DIR
+    
     # Find run directory
     if from_run == "latest":
-        run_dirs = [d for d in os.listdir(RUNS_DIR) if os.path.isdir(os.path.join(RUNS_DIR, d))]
+        if not os.path.exists(runs_dir):
+            raise FileNotFoundError(f"Runs directory not found: {runs_dir}")
+        run_dirs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
         if not run_dirs:
-            raise FileNotFoundError(f"No run directories found in: {RUNS_DIR}")
+            raise FileNotFoundError(f"No run directories found in: {runs_dir}")
         run_dirs.sort(reverse=True)  # Timestamp format sorts correctly
         run_name = run_dirs[0]
     else:
         run_name = from_run
     
-    run_path = os.path.join(RUNS_DIR, run_name)
+    run_path = os.path.join(runs_dir, run_name)
     if not os.path.exists(run_path):
         raise FileNotFoundError(f"Run directory not found: {run_path}")
     
@@ -206,8 +213,10 @@ def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> st
     if from_checkpoint:
         # Try multiple naming conventions
         candidates = [
-            f"atari_world_model_{from_checkpoint}.pt",         # best checkpoint
-            f"atari_world_model_hires_{from_checkpoint}.pt",   # epoch checkpoints
+            f"world_model_{from_checkpoint}.pt",              # best checkpoint (new)
+            f"world_model_hires_{from_checkpoint}.pt",        # epoch checkpoints (new)
+            f"atari_world_model_{from_checkpoint}.pt",        # legacy best
+            f"atari_world_model_hires_{from_checkpoint}.pt",  # legacy epoch
             f"{from_checkpoint}.pt",                           # direct name
         ]
         for ckpt_name in candidates:
@@ -219,7 +228,9 @@ def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> st
         # Find latest checkpoint by epoch number
         import glob
         import re
-        checkpoints = glob.glob(os.path.join(run_path, "atari_world_model_hires*.pt"))
+        # Find checkpoints (new naming + legacy)
+        checkpoints = glob.glob(os.path.join(run_path, "world_model*.pt"))
+        checkpoints += glob.glob(os.path.join(run_path, "atari_world_model*.pt"))
         if not checkpoints:
             raise FileNotFoundError(f"No checkpoints found in: {run_path}")
         
@@ -233,7 +244,7 @@ def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> st
                 if epoch > best_epoch:
                     best_epoch = epoch
                     best_ckpt = ckpt
-            elif basename == "atari_world_model_hires.pt" and best_epoch < 0:
+            elif basename in ("world_model_latest.pt", "atari_world_model_hires.pt") and best_epoch < 0:
                 best_ckpt = ckpt
                 best_epoch = 0
         
@@ -243,6 +254,7 @@ def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> st
 
 
 def train_world_model_hires(
+    base_dir: str = "checkpoints/v2/atari",  # Game-specific base directory
     n_epochs: int = 30,
     batch_size: int = 8,  # Reduced for K=5 rollouts
     learning_rate: float = 5e-4,  # Increased from 3e-4 to shake things up
@@ -272,13 +284,13 @@ def train_world_model_hires(
     """Train world model with high-res tokenization and multi-step rollouts."""
     os.chdir(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     
-    # Base dir for shared assets (VQ-VAE, data)
-    base_dir = "checkpoints/v2/atari"
+    # Ensure base_dir exists
     os.makedirs(base_dir, exist_ok=True)
     
     # Timestamped run directory for this training run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = f"{base_dir}/runs/{timestamp}"
+    runs_dir = f"{base_dir}/wm_runs"
+    run_dir = f"{runs_dir}/{timestamp}"
     os.makedirs(run_dir, exist_ok=True)
     print(f"Run directory: {run_dir}")
     
@@ -286,7 +298,7 @@ def train_world_model_hires(
     run_config = WorldModelConfig()
     run_config.timestamp = timestamp
     run_config.run_dir = run_dir
-    run_config.vqvae_path = f"{base_dir}/atari_vqvae_hires.pt"
+    run_config.vqvae_path = f"{base_dir}/vqvae_hires.pt"
     
     # Training params
     run_config.training.n_epochs = n_epochs
@@ -331,7 +343,11 @@ def train_world_model_hires(
     
     # === Load High-Res VQ-VAE ===
     print("\nLoading VQ-VAE...")
-    vqvae_ckpt = torch.load(f"{base_dir}/atari_vqvae_hires.pt", map_location=device, weights_only=False)
+    # Try game-agnostic name first, fall back to legacy name
+    vqvae_path = f"{base_dir}/vqvae_hires.pt"
+    if not os.path.exists(vqvae_path):
+        vqvae_path = f"{base_dir}/atari_vqvae_hires.pt"  # Legacy compatibility
+    vqvae_ckpt = torch.load(vqvae_path, map_location=device, weights_only=False)
     
     # Get model config from checkpoint
     input_h = vqvae_ckpt.get('input_h', 84)
@@ -351,7 +367,11 @@ def train_world_model_hires(
     
     # === Load Data (with optional human gameplay merge) ===
     print("\nLoading game data...")
-    data = dict(np.load(f"{base_dir}/atari_game_data.npz", allow_pickle=True))
+    # Try game-agnostic name first, fall back to legacy name
+    data_path = f"{base_dir}/game_data.npz"
+    if not os.path.exists(data_path):
+        data_path = f"{base_dir}/atari_game_data.npz"  # Legacy compatibility
+    data = dict(np.load(data_path, allow_pickle=True))
     n_actions = int(data['n_actions'])  # Must be in dataset (game-agnostic)
     print(f"  Random data: {len(data['frames'])} frames")
     
@@ -390,7 +410,11 @@ def train_world_model_hires(
     print(f"  Total frames: {len(data['frames'])}, Actions: {n_actions}")
     
     # === Tokenize Frames with High-Res VQ-VAE ===
-    tokens_path = f"{base_dir}/atari_tokens_hires.npz"
+    # Try game-agnostic name first, fall back to legacy name
+    tokens_path = f"{base_dir}/tokens.npz"
+    legacy_tokens_path = f"{base_dir}/atari_tokens_hires.npz"
+    if os.path.exists(legacy_tokens_path) and not os.path.exists(tokens_path):
+        tokens_path = legacy_tokens_path
     
     if os.path.exists(tokens_path):
         print("\nLoading cached high-res tokens...")
@@ -554,7 +578,10 @@ def train_world_model_hires(
         if resume_path:
             ckpt_path = resume_path
         else:
-            ckpt_path = f"{base_dir}/atari_world_model_hires.pt"  # Resume from base_dir
+            # Try new naming first, fall back to legacy
+            ckpt_path = f"{base_dir}/world_model_best.pt"
+            if not os.path.exists(ckpt_path):
+                ckpt_path = f"{base_dir}/atari_world_model_hires.pt"  # Legacy
         
         if os.path.exists(ckpt_path):
             print(f"\n  Loading checkpoint from {ckpt_path}...")
@@ -820,7 +847,7 @@ def train_world_model_hires(
                 'token_h': token_h,
                 'token_w': token_w,
                 'n_layers': 10,
-            }, f"{run_dir}/atari_world_model_best.pt")
+            }, f"{run_dir}/world_model_best.pt")
             # Also copy to base_dir for easy access
             torch.save({
                 'epoch': actual_epoch,
@@ -832,7 +859,7 @@ def train_world_model_hires(
                 'token_h': token_h,
                 'token_w': token_w,
                 'n_layers': 10,
-            }, f"{base_dir}/atari_world_model_best.pt")
+            }, f"{base_dir}/world_model_best.pt")
             print(f"  * New BEST! fast_val_acc={fast_val_acc:.2f}% (epoch {actual_epoch+1})")
         
         # === Gold Eval: Full validation every N epochs (for checkpointing) ===
@@ -888,7 +915,7 @@ def train_world_model_hires(
                     'token_h': token_h,
                     'token_w': token_w,
                     'n_layers': 10,
-                }, f"{run_dir}/atari_world_model_best_full.pt")
+                }, f"{run_dir}/world_model_best_gold.pt")
                 print(f"  * New BEST_GOLD! score={gold_score:.1f}% (1-step={val_acc:.1f}%, rollout_avg={rollout_avg:.1f}%)")
         else:
             val_acc = last_val_acc
@@ -934,7 +961,7 @@ def train_world_model_hires(
             'token_h': token_h,
             'token_w': token_w,
             'n_layers': 10,
-        }, f"{run_dir}/atari_world_model_hires.pt")
+        }, f"{run_dir}/world_model_latest.pt")
         
         # 2. Periodic safety checkpoint every 5 epochs
         if (actual_epoch + 1) % 5 == 0:
@@ -949,7 +976,7 @@ def train_world_model_hires(
                 'token_h': token_h,
                 'token_w': token_w,
                 'n_layers': 10,
-            }, f"{run_dir}/atari_world_model_hires_epoch{actual_epoch+1}.pt")
+            }, f"{run_dir}/world_model_epoch{actual_epoch+1}.pt")
             print(f"  Periodic checkpoint saved (epoch {actual_epoch+1})")
     
     # Plot training
@@ -963,8 +990,8 @@ def train_world_model_hires(
     print(f"Training complete! Best GOLD score: {best_val_acc:.1f}%")
     print(f"  (GOLD = 50% 1-step acc + 50% rollout avg)")
     print(f"  Run directory:   {run_dir}")
-    print(f"  Latest:          {run_dir}/atari_world_model_hires.pt")
-    print(f"  Best:            {run_dir}/atari_world_model_best_full.pt")
+    print(f"  Latest:          {run_dir}/world_model_latest.pt")
+    print(f"  Best:            {run_dir}/world_model_best_gold.pt")
     print("=" * 60)
 
 
@@ -1083,7 +1110,7 @@ def _plot_training(history, save_dir):
     axes[2, 1].set_xlim(xlim)
     
     plt.tight_layout()
-    plt.savefig(f"{save_dir}/atari_world_model_hires_training.png", dpi=150)
+    plt.savefig(f"{save_dir}/world_model_training.png", dpi=150)
     plt.close()
 
 
@@ -1221,6 +1248,10 @@ if __name__ == "__main__":
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     
+    # Game-specific directory
+    parser.add_argument('--base-dir', type=str, default="checkpoints/v2/atari",
+                        help='Base directory for game data (e.g., checkpoints/v2/mspacman)')
+    
     # All args use None as default so we can detect explicit overrides
     parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
     parser.add_argument('--batch-size', type=int, default=None, help='Batch size for training')
@@ -1270,9 +1301,10 @@ if __name__ == "__main__":
     
     # Resolve resume path if --from-run specified
     resume_path = None
+    runs_dir = f"{args.base_dir}/wm_runs"
     if args.from_run:
         args.resume = True  # Automatically enable resume if --from-run specified
-        resume_path = resolve_resume_path(args.from_run, args.from_checkpoint)
+        resume_path = resolve_resume_path(args.from_run, args.from_checkpoint, runs_dir=runs_dir)
         print(f"\n  Resume from: {resume_path}")
     
     # Print effective config
@@ -1286,6 +1318,7 @@ if __name__ == "__main__":
     print("=" * 60 + "\n")
     
     train_world_model_hires(
+        base_dir=args.base_dir,
         n_epochs=config.training.n_epochs,
         batch_size=config.training.batch_size,
         learning_rate=config.training.learning_rate,

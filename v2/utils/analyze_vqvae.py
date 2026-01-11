@@ -28,11 +28,22 @@ def load_model_and_data(checkpoint_path: str, data_path: str):
     input_w = ckpt.get('input_w', 64)
     n_embeddings = ckpt.get('n_embeddings', 256)
     
-    print(f"Model: {input_h}x{input_w} input, {n_embeddings} codes")
+    # Infer hidden_channels from layer shapes if not saved
+    hidden_channels = ckpt.get('hidden_channels', None)
+    if hidden_channels is None:
+        # Infer from encoder.initial.weight shape: (hidden_channels, in_channels, 3, 3)
+        initial_weight = ckpt['model_state_dict'].get('encoder.initial.weight')
+        if initial_weight is not None:
+            hidden_channels = initial_weight.shape[0]
+        else:
+            hidden_channels = 64  # fallback default
+    
+    print(f"Model: {input_h}x{input_w} input, {n_embeddings} codes, hidden={hidden_channels}")
     
     # Create model
     model = VQVAEHiRes(
         n_embeddings=n_embeddings,
+        hidden_channels=hidden_channels,
         input_size=(input_h, input_w),
     ).to(device)
     

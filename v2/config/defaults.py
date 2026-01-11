@@ -199,3 +199,141 @@ class WorldModelConfig:
 
 # Global default config instance
 DEFAULT_CONFIG = WorldModelConfig()
+
+
+# =============================================================================
+# VQ-VAE Configuration
+# =============================================================================
+
+@dataclass
+class VQVAEModelConfig:
+    """VQ-VAE architecture parameters."""
+    in_channels: int = 3
+    hidden_channels: int = 64
+    latent_channels: int = 256
+    n_embeddings: int = 64  # Codebook size (64 works well for Atari)
+    n_residual: int = 2
+    
+    # Input dimensions (auto-detected from data if not set)
+    input_h: int = 84
+    input_w: int = 64
+
+
+@dataclass
+class VQVAETrainingConfig:
+    """VQ-VAE training hyperparameters."""
+    n_epochs: int = 25
+    batch_size: int = 128
+    learning_rate: float = 3e-4
+    max_batches: int = 0  # 0 = all batches
+    max_frames: int = 1000000  # ~1M frames for good coverage
+    workers: int = 0
+    
+    # Loss weights
+    beta: float = 0.1  # VQ loss weight
+    edge_weight: float = 0.05  # Sobel edge loss weight
+    
+    # EMA settings
+    ema_decay: float = 0.95
+    ema_update_every: int = 10
+
+
+@dataclass
+class DataCollectionConfig:
+    """Data collection parameters."""
+    n_episodes: int = 500  # ~500 episodes to get ~1M frames
+    max_steps: int = 2000  # Max steps per episode
+    target_width: int = 64
+    preserve_aspect: bool = True
+
+
+@dataclass
+class VQVAEConfig:
+    """Complete configuration for VQ-VAE training."""
+    model: VQVAEModelConfig = field(default_factory=VQVAEModelConfig)
+    training: VQVAETrainingConfig = field(default_factory=VQVAETrainingConfig)
+    collection: DataCollectionConfig = field(default_factory=DataCollectionConfig)
+    
+    # Runtime info (populated during training)
+    timestamp: Optional[str] = None
+    run_dir: Optional[str] = None
+    data_path: Optional[str] = None
+    
+    def to_dict(self) -> dict:
+        """Convert to nested dictionary for JSON serialization."""
+        return {
+            'model': asdict(self.model),
+            'training': asdict(self.training),
+            'collection': asdict(self.collection),
+            'timestamp': self.timestamp,
+            'run_dir': self.run_dir,
+            'data_path': self.data_path,
+        }
+    
+    def to_json(self, indent: int = 2) -> str:
+        """Serialize to JSON string."""
+        return json.dumps(self.to_dict(), indent=indent)
+    
+    def save(self, path: str):
+        """Save config to JSON file."""
+        with open(path, 'w') as f:
+            f.write(self.to_json())
+    
+    @classmethod
+    def from_dict(cls, d: dict) -> 'VQVAEConfig':
+        """Create config from dictionary."""
+        def filter_fields(data: dict, dataclass_type) -> dict:
+            if not data:
+                return {}
+            valid_fields = {f.name for f in dataclass_type.__dataclass_fields__.values()}
+            return {k: v for k, v in data.items() if k in valid_fields}
+        
+        return cls(
+            model=VQVAEModelConfig(**filter_fields(d.get('model', {}), VQVAEModelConfig)),
+            training=VQVAETrainingConfig(**filter_fields(d.get('training', {}), VQVAETrainingConfig)),
+            collection=DataCollectionConfig(**filter_fields(d.get('collection', {}), DataCollectionConfig)),
+            timestamp=d.get('timestamp'),
+            run_dir=d.get('run_dir'),
+            data_path=d.get('data_path'),
+        )
+    
+    @classmethod
+    def load(cls, path: str) -> 'VQVAEConfig':
+        """Load config from JSON file."""
+        with open(path, 'r') as f:
+            return cls.from_dict(json.loads(f.read()))
+    
+    def update_from_args(self, args) -> 'VQVAEConfig':
+        """Update config from argparse namespace."""
+        # Training params
+        if hasattr(args, 'epochs') and args.epochs is not None:
+            self.training.n_epochs = args.epochs
+        if hasattr(args, 'batch_size') and args.batch_size is not None:
+            self.training.batch_size = args.batch_size
+        if hasattr(args, 'lr') and args.lr is not None:
+            self.training.learning_rate = args.lr
+        if hasattr(args, 'max_batches') and args.max_batches is not None:
+            self.training.max_batches = args.max_batches
+        if hasattr(args, 'max_frames') and args.max_frames is not None:
+            self.training.max_frames = args.max_frames
+        if hasattr(args, 'workers') and args.workers is not None:
+            self.training.workers = args.workers
+        if hasattr(args, 'beta') and args.beta is not None:
+            self.training.beta = args.beta
+        if hasattr(args, 'edge_weight') and args.edge_weight is not None:
+            self.training.edge_weight = args.edge_weight
+        if hasattr(args, 'ema_decay') and args.ema_decay is not None:
+            self.training.ema_decay = args.ema_decay
+        if hasattr(args, 'ema_update_every') and args.ema_update_every is not None:
+            self.training.ema_update_every = args.ema_update_every
+        
+        # Model params
+        if hasattr(args, 'n_embeddings') and args.n_embeddings is not None:
+            self.model.n_embeddings = args.n_embeddings
+        if hasattr(args, 'hidden_channels') and args.hidden_channels is not None:
+            self.model.hidden_channels = args.hidden_channels
+        
+        return self
+
+
+DEFAULT_VQVAE_CONFIG = VQVAEConfig()
