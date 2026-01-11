@@ -13,7 +13,7 @@ import sys
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from v2.models.vqvae_hires import VQVAEHiRes
+from models.vqvae_hires import VQVAEHiRes
 
 
 def load_model_and_data(checkpoint_path: str, data_path: str):

@@ -1,48 +1,157 @@
 """
-Token Importance Weighting (v2.0)
-=================================
+Token Importance Weighting (v2.0) + Focal Loss (v3.0)
+=====================================================
 Game-agnostic importance weighting for world model training.
 
-Combines multiple signals:
+v2.0 Signals:
 - Embedding-distance motion (robust to codebook jitter)
 - Eventness spike detection (catches "fire" moments)
 - Multi-frame persistence (stabilizes tracking)
 - Percentile-based safe capping (prevents context starvation)
+
+v3.0 Focal Loss:
+- Automatically upweights tokens the model struggles with
+- Self-adjusting: no manual detection of "important" tokens needed
+- Composes multiplicatively with motion weights
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+def _compute_focal_components(
+    logits: torch.Tensor,  # (B, N, vocab) or (B*N, vocab)
+    targets: torch.Tensor,  # (B, N) or (B*N,)
+    gamma: float = 2.0,
+) -> tuple[torch.Tensor, torch.Tensor, tuple]:
+    """
+    Shared focal loss computation - returns log_p_t, focal_weight, original_shape.
+    
+    Uses single log_softmax for numerical stability.
+    """
+    original_shape = targets.shape
+    if logits.dim() == 3:
+        B, N, V = logits.shape
+        logits_flat = logits.reshape(-1, V)
+        targets_flat = targets.reshape(-1)
+    else:
+        logits_flat = logits
+        targets_flat = targets.reshape(-1)
+    
+    # Single log_softmax for numerical stability
+    log_probs = F.log_softmax(logits_flat, dim=-1)  # (B*N, vocab)
+    
+    # Get log probability of correct class
+    log_p_t = log_probs.gather(dim=-1, index=targets_flat.unsqueeze(-1)).squeeze(-1)  # (B*N,)
+    
+    # Convert to probability for focal weight (stable since log_p_t <= 0)
+    p_t = log_p_t.exp()  # (B*N,)
+    
+    # Focal weight: (1 - p_t)^gamma
+    focal_weight = (1 - p_t) ** gamma
+    
+    return log_p_t, focal_weight, original_shape
+
+
+def focal_loss_per_token(
+    logits: torch.Tensor,       # (B, N, vocab) or (B*N, vocab)
+    targets: torch.Tensor,      # (B, N) or (B*N,)
+    gamma: float = 2.0,         # Focusing parameter (higher = more focus on hard examples)
+    reduction: str = 'none',    # 'none' returns per-token loss
+) -> torch.Tensor:
+    """
+    Focal Loss for token prediction (v3.0) - numerically stable version.
+    
+    Standard CE:    -log(p_t)
+    Focal Loss:     -(1 - p_t)^γ * log(p_t)
+    
+    When model is confident and correct (p=0.95): weight = (0.05)^2 = 0.0025
+    When model is uncertain (p=0.50): weight = (0.50)^2 = 0.25 → 100x more!
+    
+    Args:
+        logits: Raw model output before softmax
+        targets: Ground truth token indices
+        gamma: Focusing parameter (default 2.0, higher = more focus on hard)
+        reduction: 'none', 'mean', or 'sum'
+        
+    Returns:
+        Focal loss (per-token if reduction='none')
+    """
+    log_p_t, focal_weight, original_shape = _compute_focal_components(logits, targets, gamma)
+    
+    # Focal loss: -(1 - p_t)^gamma * log(p_t)
+    focal = -focal_weight * log_p_t
+    
+    # Reshape back to original
+    focal = focal.reshape(original_shape)
+    
+    if reduction == 'mean':
+        return focal.mean()
+    elif reduction == 'sum':
+        return focal.sum()
+    return focal
+
+
+def focal_loss_with_motion_weights(
+    logits: torch.Tensor,           # (B, N, vocab)
+    targets: torch.Tensor,          # (B, N)
+    motion_weights: torch.Tensor,   # (B, N) from compute_hybrid_importance_weights
+    gamma: float = 2.0,
+) -> torch.Tensor:
+    """
+    Combine focal loss with motion-based importance weights.
+    
+    Total weight = focal_weight * motion_weight, normalized per-sample.
+    
+    Key fix: Normalizes combined weights per-sample to prevent gradient scale
+    drift as model improves (focal shrinks easy tokens drastically).
+    
+    This gives maximum upweighting to tokens that are:
+    1. Hard to predict (focal loss detects this)
+    2. In motion (motion weights detect this)
+    """
+    B, N = targets.shape
+    
+    # Reuse shared computation
+    log_p_t, focal_weight, _ = _compute_focal_components(logits, targets, gamma)
+    log_p_t = log_p_t.reshape(B, N)
+    focal_weight = focal_weight.reshape(B, N)
+    
+    # Combined weight = focal * motion
+    combined_weight = focal_weight * motion_weights  # (B, N)
+    
+    # Normalize per-sample to keep gradient scale stable
+    combined_weight = combined_weight / (combined_weight.mean(dim=1, keepdim=True) + 1e-8)
+    
+    # Apply to negative log likelihood
+    loss_per_token = -log_p_t * combined_weight  # (B, N)
+    
+    return loss_per_token.mean()
 
 
 def compute_hybrid_importance_weights(
     target_tokens: torch.Tensor,      # (B, N)
     history_tokens: torch.Tensor,     # (B, T, N)
-    token_embedding: nn.Embedding,    # Model's token embedding layer
+    token_embedding: nn.Embedding,    # VQ-VAE codebook (vqvae.quantizer.embedding)
     device: torch.device,
     motion_scale: float = 2.0,        # Embedding-distance motion weight
-    eventness_scale: float = 2.0,     # Spike detection weight
+    eventness_scale: float = 2.0,     # Spike detection weight (applied to movers only)
     persistence_scale: float = 1.0,   # Multi-frame persistence weight
     max_ratio: float = 6.0,           # Safe cap: 95th percentile / median ≤ max_ratio
+    min_movers_for_eventness: int = 4,  # Minimum moved tokens to compute eventness
+    mover_top_frac: float = 0.02,     # v2.3: top fraction of tokens considered "movers"
 ) -> torch.Tensor:
     """
-    Hybrid importance weighting (v2.0) - game-agnostic, robust.
+    Hybrid importance weighting (v2.3) - robust mover detection.
     
-    Combines:
-    1. Embedding-distance motion: L2 distance in embedding space (not token ID)
-       - Robust to codebook neighbor jitter
-       - Captures magnitude of visual change
+    v2.3 fixes:
+    - Mover selection uses top-k AND absolute threshold (not just "top 10%")
+    - Eventness uses blended mover mask (moved_now OR moved_prev) for stability
+    - Persistence uses per-step threshold for consistency across frames
     
-    2. Eventness spike detection: sample-level motion spike vs recent history
-       - Upweights frames with unusual motion (ball fire, explosions, spawns)
-       - Helps model learn rare but critical transitions
-    
-    3. Persistence: tokens that move in multiple consecutive frames
-       - Distinguishes real movers (ball) from jitter
-       - Smooth decay to avoid abrupt weight changes
-    
-    4. Safe percentile capping: prevents extreme ratios that starve context
-       - Caps at max_ratio × median instead of hard max
-       - Preserves relative importance while preventing instability
+    IMPORTANT: Pass VQ-VAE codebook (vqvae.quantizer.embedding), NOT transformer embeddings.
+    VQ-VAE codebook is trained for visual similarity and is stable from epoch 0.
     
     Returns: (B, N) weight tensor (mean ~1.0 per sample)
     """
@@ -57,44 +166,85 @@ def compute_hybrid_importance_weights(
         # L2 distance in embedding space
         motion_mag = torch.norm(target_emb - prev_emb, dim=-1)  # (B, N)
         
-        # Robust normalize: divide by median (not mean) to reduce outlier sensitivity
-        motion_median = motion_mag.median(dim=1, keepdim=True).values.clamp(min=1e-6)
-        motion_norm = motion_mag / motion_median
+        # v2.3: Use 75th percentile for normalization (robust to mostly-static frames)
+        p75 = torch.quantile(motion_mag, 0.75, dim=1, keepdim=True).clamp(min=1e-3)
+        motion_norm = motion_mag / p75
         
-        # === 2. Eventness Spike Detection ===
-        sample_motion = motion_mag.mean(dim=1)  # (B,)
+        # v2.3 fix: Mover detection with top-k AND absolute threshold
+        # This prevents "top 10% no matter what" - only picks real movers
+        k = max(min_movers_for_eventness, int(mover_top_frac * N))  # e.g., 2% of tokens, at least 4
+        topk_vals, _ = motion_mag.topk(k, dim=1)  # (B, k)
+        topk_threshold = topk_vals[:, -1:]  # kth largest value per sample
+        
+        # Absolute minimum: must be above 50% of p75 to be a "real" mover
+        abs_threshold = (p75 * 0.5).clamp(min=1e-4)
+        
+        # Final threshold: max of top-k cutoff and absolute minimum
+        motion_threshold = torch.maximum(topk_threshold, abs_threshold)  # (B, 1)
+        moved_mask = (motion_mag >= motion_threshold).float()  # (B, N)
+        
+        # Count movers per sample for gating eventness
+        n_movers = moved_mask.sum(dim=1)  # (B,)
+        
+        # === 2. Eventness Spike Detection (gated, blended mask) ===
+        eventness_weight = torch.zeros(B, N, device=device)
         
         if T >= 2:
             prev2_emb = token_embedding(history_tokens[:, -2])
             hist_motion_mag = torch.norm(prev_emb - prev2_emb, dim=-1)
-            hist_motion = hist_motion_mag.mean(dim=1)
             
-            # Spike ratio: high = "something just happened"
-            eventness = (sample_motion / (hist_motion + 1e-6)).clamp(min=0.5, max=3.0)
-            eventness = (eventness - 1.0)  # Center at 0
-        else:
-            eventness = torch.zeros(B, device=device)
+            # v2.3 fix: Use blended mover mask (moved_now OR moved_prev)
+            # This stabilizes eventness when the moving set changes rapidly
+            hist_topk_vals, _ = hist_motion_mag.topk(k, dim=1)
+            hist_topk_threshold = hist_topk_vals[:, -1:]
+            hist_threshold = torch.maximum(hist_topk_threshold, abs_threshold)
+            hist_moved_mask = (hist_motion_mag >= hist_threshold).float()
+            
+            # Blended mask: tokens that moved in either step
+            blended_mask = torch.clamp(moved_mask + hist_moved_mask, max=1.0)
+            n_blended = blended_mask.sum(dim=1)
+            
+            has_movers = (n_blended >= min_movers_for_eventness)  # (B,)
+            
+            if has_movers.any():
+                # Compare current vs historical motion using blended mask
+                sample_motion = (motion_mag * blended_mask).sum(dim=1) / (n_blended + 1e-6)
+                hist_motion = (hist_motion_mag * blended_mask).sum(dim=1) / (n_blended + 1e-6)
+                
+                # Spike ratio: high = "something just happened"
+                eventness = (sample_motion / (hist_motion + 1e-6)).clamp(min=0.5, max=3.0)
+                eventness = (eventness - 1.0)  # Center at 0, range [-0.5, 2.0]
+                
+                # Zero out eventness for samples without enough movers
+                eventness = eventness * has_movers.float()
+                
+                # Apply eventness to blended mask (tokens that moved in either step)
+                eventness_weight = eventness.unsqueeze(1) * blended_mask  # (B, N)
         
-        eventness_weight = eventness.unsqueeze(1).expand(B, N)
+        # === 3. Persistence (multi-frame motion consistency, per-step threshold) ===
+        persistence = torch.zeros(B, N, device=device)
         
-        # === 3. Persistence (multi-frame motion consistency) ===
         if T >= 2:
-            persistence = torch.zeros(B, N, device=device)
             prev_frame_emb = token_embedding(history_tokens[:, -1])
             
             for t in range(T - 2, -1, -1):
                 curr_frame_emb = token_embedding(history_tokens[:, t])
                 frame_motion = torch.norm(prev_frame_emb - curr_frame_emb, dim=-1)
                 
-                moved = (frame_motion > motion_median * 0.5).float()
+                # v2.3 fix: Compute per-step threshold (consistent within each step)
+                step_p75 = torch.quantile(frame_motion, 0.75, dim=1, keepdim=True).clamp(min=1e-3)
+                step_topk_vals, _ = frame_motion.topk(k, dim=1)
+                step_topk_thr = step_topk_vals[:, -1:]
+                step_abs_thr = (step_p75 * 0.5).clamp(min=1e-4)
+                step_threshold = torch.maximum(step_topk_thr, step_abs_thr)
+                
+                moved = (frame_motion >= step_threshold).float()
                 decay = 0.7 ** (T - 1 - t)
-                persistence += moved * decay
+                persistence = persistence + moved * decay
                 
                 prev_frame_emb = curr_frame_emb
             
             persistence = persistence / (T - 1)
-        else:
-            persistence = torch.zeros(B, N, device=device)
         
         # === Combine Signals ===
         weights = (

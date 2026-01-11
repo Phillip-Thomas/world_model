@@ -10,6 +10,7 @@ VQ-VAE Training Script v2.13 (Performance Optimized)
 import sys
 import os
 import gc
+import itertools
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
@@ -77,20 +78,31 @@ def sobel_edge_loss(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
 
 
 class FrameWithPrevDataset(torch.utils.data.Dataset):
-    """Dataset that returns (frame_t, frame_{t-1}) for motion-weighted loss."""
-    def __init__(self, frames_tensor: torch.Tensor, episode_starts_set: set):
-        self.x = frames_tensor
+    """
+    Dataset that returns (frame_t, frame_{t-1}) for motion-weighted loss.
+    
+    v2.21: Stores frames as uint8 numpy array to save ~4x RAM.
+    Normalization to float32 [-1, 1] happens per-batch in __getitem__.
+    """
+    def __init__(self, frames_uint8: np.ndarray, episode_starts_set: set):
+        # Keep as uint8 numpy - only ~2.4GB for 150k frames instead of ~10GB float32
+        self.x = frames_uint8  # (N, H, W, C) uint8
         self.episode_starts = episode_starts_set
     
     def __len__(self):
         return self.x.shape[0]
     
     def __getitem__(self, i):
-        x = self.x[i]
+        # Convert to float32 and normalize per-sample (not upfront!)
+        frame = torch.from_numpy(self.x[i]).float()
+        frame = frame.permute(2, 0, 1) / 127.5 - 1.0  # (H,W,C) -> (C,H,W), normalize
+        
         # Use same frame if at episode start or index 0
         j = i if (i in self.episode_starts or i == 0) else (i - 1)
-        x_prev = self.x[j]
-        return x, x_prev
+        prev_frame = torch.from_numpy(self.x[j]).float()
+        prev_frame = prev_frame.permute(2, 0, 1) / 127.5 - 1.0
+        
+        return frame, prev_frame
 
 
 def episode_based_split(episode_starts: np.ndarray, total_frames: int, val_ratio: float = 0.1):
@@ -129,6 +141,7 @@ def train_vqvae_hires(
     resume: str = None,
     workers: int = 0,
     max_batches_per_epoch: int = None,
+    max_frames: int = 200000,  # Limit frames loaded to avoid OOM
 ):
     """
     Train VQ-VAE v2.13 with performance optimizations.
@@ -143,54 +156,76 @@ def train_vqvae_hires(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
+    # v2.22: Limit GPU memory to prevent spilling into shared memory
+    if device.type == "cuda":
+        # Get total GPU memory and limit to 90% to leave headroom
+        total_mem = torch.cuda.get_device_properties(0).total_memory
+        # Set memory fraction to prevent shared memory usage
+        torch.cuda.set_per_process_memory_fraction(0.85, 0)
+        print(f"  GPU memory limit: {total_mem * 0.85 / 1e9:.1f}GB (85% of {total_mem / 1e9:.1f}GB)")
+    
     # Load data
     print("\nLoading game data...")
     data = np.load(data_path, allow_pickle=True)
     frames = data['frames']
     episode_starts = data.get('episode_starts', np.array([0]))
     
+    # Limit frames to avoid OOM (VQ-VAE doesn't need all frames to learn codebook)
+    if max_frames and len(frames) > max_frames:
+        print(f"  Limiting to {max_frames:,} frames (from {len(frames):,}) to fit in RAM")
+        frames = frames[:max_frames]
+        # Adjust episode_starts to only include valid ones
+        episode_starts = episode_starts[episode_starts < max_frames]
+    
     print(f"  Loaded {len(frames):,} frames")
     print(f"  Frame size: {frames.shape[1]}x{frames.shape[2]}x{frames.shape[3]}")
     print(f"  Episodes: {len(episode_starts)}")
+    ram_mb = frames.nbytes / 1024 / 1024
+    print(f"  RAM usage: {ram_mb:.0f} MB (uint8, ~4x smaller than float32)")
     
     input_h, input_w = frames.shape[1], frames.shape[2]
     token_h, token_w = input_h // 4, input_w // 4
     print(f"  Token grid: {token_h}x{token_w} = {token_h * token_w} tokens")
     
-    # Normalize frames to [-1, 1]
-    frames_tensor = torch.from_numpy(frames).float()
-    frames_tensor = frames_tensor.permute(0, 3, 1, 2) / 127.5 - 1.0
+    # v2.21: Keep frames as uint8 numpy - normalization happens per-batch in Dataset
+    # This saves ~4x RAM (2.4GB vs 10GB for 150k frames)
+    data.close()  # Close the npz file handle
+    del data
     
     # Episode-based split
     print(f"\n  Splitting by episode (no frame leakage)...")
-    train_indices, val_indices = episode_based_split(episode_starts, len(frames_tensor))
+    train_indices, val_indices = episode_based_split(episode_starts, len(frames))
     print(f"  Train: {len(train_indices):,}, Val: {len(val_indices):,}")
     
-    # Create datasets
+    # Create datasets - pass uint8 numpy array directly
     episode_starts_set = set(int(v) for v in episode_starts.tolist()) if len(episode_starts) else set()
-    full_dataset = FrameWithPrevDataset(frames_tensor, episode_starts_set)
+    full_dataset = FrameWithPrevDataset(frames, episode_starts_set)
     
     train_dataset = torch.utils.data.Subset(full_dataset, train_indices)
     val_dataset = torch.utils.data.Subset(full_dataset, val_indices)
     
-    # DataLoaders with performance optimizations
+    # v2.20: Disable persistent_workers when using max_batches to prevent memory leak on break
+    use_persistent = (workers > 0) and (max_batches_per_epoch is None)
+    
+    # v2.22: Disable pin_memory to prevent dedicated GPU memory accumulation
+    # Pinned memory shows up as "dedicated" and doesn't get released
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
         num_workers=workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,  # Disabled to prevent memory accumulation
         drop_last=True,
-        persistent_workers=(workers > 0),
+        persistent_workers=use_persistent,
     )
     val_loader = torch.utils.data.DataLoader(
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
         num_workers=workers,
-        pin_memory=(device.type == "cuda"),
+        pin_memory=False,  # Disabled to prevent memory accumulation
         drop_last=False,
-        persistent_workers=(workers > 0),
+        persistent_workers=use_persistent,
     )
     
     # Create model
@@ -288,10 +323,13 @@ def train_vqvae_hires(
     # Note: GC stays enabled but we call it periodically to prevent buildup
     
     for epoch in range(start_epoch, n_epochs):
+        # v2.22: Clear GPU cache at START of each epoch (like world model training)
+        torch.cuda.empty_cache()
+        gc.collect()
+        
         model.train()
         model.reset_usage_counts()
         
-
         # Commitment annealing: ramp from 0 to 0.25 over first 5 epochs
         if epoch < 5:
             model.quantizer.commitment_cost = 0.25 * (epoch / 5)
@@ -302,10 +340,9 @@ def train_vqvae_hires(
         train_l1 = 0.0
         batch_count = 0
         
-        # GPU-side accumulator for epoch histogram
-        epoch_counts = torch.zeros(n_embeddings, device=device)
-        
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{n_epochs}", total=effective_batches)
+        # v2.20: Use islice to iterate exactly N batches (clean termination, no break leak)
+        train_iter = itertools.islice(train_loader, effective_batches)
+        pbar = tqdm(train_iter, desc=f"Epoch {epoch+1}/{n_epochs}", total=effective_batches)
         last_loss = 0.0
         last_l1 = 0.0
         
@@ -349,12 +386,6 @@ def train_vqvae_hires(
             scaler.step(optimizer)
             scaler.update()
             
-            # Accumulate histogram on GPU (no sync) - use temp var to avoid holding references
-            idx_flat = indices.flatten().long()
-            counts_batch = torch.bincount(idx_flat, minlength=n_embeddings).float()
-            epoch_counts += counts_batch
-            del idx_flat, counts_batch
-            
             # Track losses as Python floats to prevent GPU tensor accumulation
             last_loss_val = loss.detach().item()
             last_l1_val = recon_l1.detach().item()
@@ -362,37 +393,43 @@ def train_vqvae_hires(
             train_l1 += last_l1_val
             batch_count += 1
             
-            # v2.15: Explicit deletion of ALL intermediate tensors including batch/prev_batch
-            del recon, vq_loss, motion, brightness, motion_mask, bright_mask, w, diff
-            del recon_l1, recon_mse, recon_loss, loss, indices
+            # v2.19: Delete ALL intermediate tensors to prevent memory growth
+            del recon, vq_loss, indices, loss
+            del motion, brightness, motion_mask, bright_mask, w, diff
+            del recon_l1, recon_mse, recon_loss
             del batch, prev_batch
             if edge_weight > 0:
                 del edge_loss
             
-            # v2.16: AGGRESSIVE cleanup EVERY batch with sync to prevent leak
-            gc.collect()  # Force Python GC
-            torch.cuda.synchronize()  # Complete all GPU operations
-            torch.cuda.empty_cache()  # Return cached memory to GPU
+            # v2.22: Periodic cache clear to prevent VRAM growth into shared memory
+            if batch_count % 500 == 0:
+                torch.cuda.empty_cache()
             
             # Update tqdm
             if batch_count % tqdm_update_every == 0:
                 pbar.set_postfix(loss=f"{last_loss_val:.4f}", L1=f"{last_l1_val:.4f}")
-            
-            # Check max batches
-            if max_batches_per_epoch and batch_count >= max_batches_per_epoch:
-                break
         
+        # v2.20: No break needed - islice handles batch limit cleanly
         pbar.close()
         scheduler.step()
         
-        # Compute epoch stats from GPU histogram (single sync)
-        epoch_total = epoch_counts.sum()
-        epoch_probs = epoch_counts / (epoch_total + 1e-8)
-        epoch_probs_nonzero = epoch_probs[epoch_probs > 0]
-        epoch_entropy = -torch.sum(epoch_probs_nonzero * torch.log(epoch_probs_nonzero + 1e-10))
-        epoch_perplexity = torch.exp(epoch_entropy).item()
-        epoch_usage = (epoch_counts > 0).float().mean().item() * 100
-        epoch_dead = (epoch_counts == 0).sum().item()
+        # v2.20: Compute epoch stats on CPU to avoid VRAM spike from clone()
+        with torch.no_grad():
+            epoch_counts_cpu = model.quantizer.usage_counts.cpu().numpy()
+            epoch_total = epoch_counts_cpu.sum()
+            if epoch_total > 0:
+                epoch_probs = epoch_counts_cpu / epoch_total
+                nonzero_mask = epoch_probs > 0
+                probs_nonzero = epoch_probs[nonzero_mask]
+                epoch_entropy = -np.sum(probs_nonzero * np.log(probs_nonzero + 1e-10))
+                epoch_perplexity = float(np.exp(epoch_entropy))
+                epoch_usage = float(nonzero_mask.mean() * 100)
+                epoch_dead = int((~nonzero_mask).sum())
+            else:
+                epoch_perplexity, epoch_usage, epoch_dead = 0.0, 0.0, n_embeddings
+        
+        # v2.17: Clean up memory ONCE per epoch
+        torch.cuda.empty_cache()
         
         # Average losses (already Python floats, no sync needed)
         avg_train_loss = train_loss / batch_count
@@ -403,8 +440,8 @@ def train_vqvae_hires(
         model.eval()
         val_loss = 0.0
         val_count = 0
-        val_counts = torch.zeros(n_embeddings, device=device)
         
+        # v2.20: Validation with explicit tensor cleanup
         with torch.no_grad():
             for batch, _ in val_loader:
                 batch = batch.to(device, non_blocking=True)
@@ -419,17 +456,19 @@ def train_vqvae_hires(
                         recon_loss = recon_loss + edge_weight * edge_loss
                     loss = recon_loss + beta * vq_loss
                 
-                val_loss += loss.item()  # FIX: Use .item() to prevent GPU tensor accumulation
+                val_loss += loss.item()
                 val_count += 1
-                val_counts += torch.bincount(indices.flatten().long(), minlength=n_embeddings).float()
+                
+                # v2.20: Explicit cleanup to reduce VRAM peak
+                del recon, vq_loss, indices, loss, recon_l1, recon_mse, recon_loss, batch
+                if edge_weight > 0:
+                    del edge_loss
         
-        # Compute average (val_loss is already Python float)
+        # Compute average
         avg_val_loss = val_loss / val_count if val_count > 0 else 0.0
         
-        
-        # Get EMA dead codes count
-        ema_stats = model.get_codebook_stats()
-        ema_dead = ema_stats.get('ema_dead_codes', 0)
+        # Get EMA dead codes count (extract Python int immediately)
+        ema_dead = model.get_codebook_stats().get('ema_dead_codes', 0)
         
         print(f"\n  Epoch {epoch+1}: loss={avg_val_loss:.4f}, L1={avg_train_l1:.4f}, "
               f"usage={epoch_usage:.1f}%, pplx={int(epoch_perplexity)}, "
@@ -474,9 +513,11 @@ def train_vqvae_hires(
             }, checkpoint_path / f"atari_vqvae_hires_epoch{epoch+1}.pt")
             print(f"  Checkpoint saved (epoch {epoch+1})")
         
-        # Final cleanup at epoch end
+        # v2.22: Aggressive cleanup after checkpoint saves to prevent memory buildup
+        # torch.save() creates copies of state_dicts that need to be freed
         gc.collect()
         torch.cuda.empty_cache()
+        gc.collect()  # Double GC to catch circular references
     
     # Plot training
     _plot_training(history, checkpoint_path, n_embeddings)
@@ -545,6 +586,7 @@ if __name__ == "__main__":
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--max-batches", type=int, default=None)
+    parser.add_argument("--max-frames", type=int, default=200000, help="Max frames to load (avoids OOM)")
     
     args = parser.parse_args()
     
@@ -562,4 +604,5 @@ if __name__ == "__main__":
         resume=args.resume,
         workers=args.workers,
         max_batches_per_epoch=args.max_batches,
+        max_frames=args.max_frames,
     )

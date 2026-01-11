@@ -47,7 +47,13 @@ from models.temporal_world_model import TemporalVisualWorldModel
 from data.atari_dataset import AtariTemporalDataset
 from data.multistep_dataset import MultiStepDataset
 from eval.gold_eval import GoldEvalSuite, run_gold_eval, format_gold_metrics
-from utils.importance_weights import compute_hybrid_importance_weights, compute_token_importance_weights
+from utils.importance_weights import (
+    compute_hybrid_importance_weights, 
+    compute_token_importance_weights,
+    focal_loss_per_token,
+    focal_loss_with_motion_weights,
+)
+from config import WorldModelConfig
 
 
 def multistep_rollout_loss(
@@ -64,6 +70,9 @@ def multistep_rollout_loss(
     eventness_scale: float = 2.0,
     persistence_scale: float = 1.0,
     max_ratio: float = 6.0,
+    # v3.0: Focal loss
+    use_focal_loss: bool = True,
+    focal_gamma: float = 2.0,
 ) -> tuple:
     """
     Compute multi-step rollout loss with discounted step weights.
@@ -107,19 +116,28 @@ def multistep_rollout_loss(
                 persistence_scale=persistence_scale,
                 max_ratio=max_ratio,
             )
-            # Weighted CE loss
-            ce_per_token = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                target_k.reshape(-1),
-                reduction='none'
-            ).reshape(B, N)
-            loss = (ce_per_token * token_weights).mean()
+            # v3.0: Focal loss + motion weights
+            if use_focal_loss:
+                loss = focal_loss_with_motion_weights(
+                    logits, target_k, token_weights, gamma=focal_gamma
+                )
+            else:
+                # Standard weighted CE loss
+                ce_per_token = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    target_k.reshape(-1),
+                    reduction='none'
+                ).reshape(B, N)
+                loss = (ce_per_token * token_weights).mean()
         else:
-            # Standard CE loss
-            loss = F.cross_entropy(
-                logits.reshape(-1, logits.size(-1)),
-                target_k.reshape(-1),
-            )
+            # Standard CE loss (no weighting)
+            if use_focal_loss:
+                loss = focal_loss_per_token(logits, target_k, gamma=focal_gamma, reduction='mean')
+            else:
+                loss = F.cross_entropy(
+                    logits.reshape(-1, logits.size(-1)),
+                    target_k.reshape(-1),
+                )
         
         total_loss = total_loss + step_weight * loss
         weight_sum += step_weight  # v2.1: accumulate for normalization
@@ -153,11 +171,83 @@ def multistep_rollout_loss(
     return total_loss, step_accs
 
 
+RUNS_DIR = "checkpoints/v2/atari/runs"
+
+
+def resolve_resume_path(from_run: str = None, from_checkpoint: str = None) -> str:
+    """
+    Resolve checkpoint path for resuming training.
+    
+    Args:
+        from_run: Run directory name (e.g., "20260110_111307") or "latest"
+        from_checkpoint: Checkpoint name (e.g., "best", "epoch240") or None for latest
+        
+    Returns:
+        Full path to checkpoint file, or None if from_run not specified
+    """
+    if not from_run:
+        return None
+    
+    # Find run directory
+    if from_run == "latest":
+        run_dirs = [d for d in os.listdir(RUNS_DIR) if os.path.isdir(os.path.join(RUNS_DIR, d))]
+        if not run_dirs:
+            raise FileNotFoundError(f"No run directories found in: {RUNS_DIR}")
+        run_dirs.sort(reverse=True)  # Timestamp format sorts correctly
+        run_name = run_dirs[0]
+    else:
+        run_name = from_run
+    
+    run_path = os.path.join(RUNS_DIR, run_name)
+    if not os.path.exists(run_path):
+        raise FileNotFoundError(f"Run directory not found: {run_path}")
+    
+    # Find checkpoint
+    if from_checkpoint:
+        # Try multiple naming conventions
+        candidates = [
+            f"atari_world_model_{from_checkpoint}.pt",         # best checkpoint
+            f"atari_world_model_hires_{from_checkpoint}.pt",   # epoch checkpoints
+            f"{from_checkpoint}.pt",                           # direct name
+        ]
+        for ckpt_name in candidates:
+            ckpt_path = os.path.join(run_path, ckpt_name)
+            if os.path.exists(ckpt_path):
+                return ckpt_path
+        raise FileNotFoundError(f"Checkpoint not found: {from_checkpoint} in {run_path}\n  Tried: {candidates}")
+    else:
+        # Find latest checkpoint by epoch number
+        import glob
+        import re
+        checkpoints = glob.glob(os.path.join(run_path, "atari_world_model_hires*.pt"))
+        if not checkpoints:
+            raise FileNotFoundError(f"No checkpoints found in: {run_path}")
+        
+        best_ckpt = None
+        best_epoch = -1
+        for ckpt in checkpoints:
+            basename = os.path.basename(ckpt)
+            match = re.search(r'epoch(\d+)\.pt$', basename)
+            if match:
+                epoch = int(match.group(1))
+                if epoch > best_epoch:
+                    best_epoch = epoch
+                    best_ckpt = ckpt
+            elif basename == "atari_world_model_hires.pt" and best_epoch < 0:
+                best_ckpt = ckpt
+                best_epoch = 0
+        
+        if best_ckpt is None:
+            raise FileNotFoundError(f"No valid checkpoint found in: {run_path}")
+        return best_ckpt
+
+
 def train_world_model_hires(
     n_epochs: int = 30,
     batch_size: int = 8,  # Reduced for K=5 rollouts
     learning_rate: float = 5e-4,  # Increased from 3e-4 to shake things up
     resume: bool = False,
+    resume_path: str = None,  # Explicit path to resume from (overrides default)
     max_batches: int = 100,  # Limit batches per epoch for faster iteration
     full_val_every: int = 999,  # Disabled for quick iteration (only final epoch)
     # v1.3: Multi-step rollout training
@@ -169,6 +259,11 @@ def train_world_model_hires(
     eventness_scale: float = 2.0,     # Spike detection boost (fire/spawn moments)
     persistence_scale: float = 1.0,   # Multi-frame consistency boost
     max_ratio: float = 6.0,           # Safe cap: 95th/median ratio limit
+    # v2.1: Teacher forcing for multi-step rollouts
+    teacher_forcing_prob: float = 0.1,  # Probability of using true target in rollouts
+    # v3.0: Focal loss (auto-upweights hard tokens)
+    use_focal_loss: bool = True,      # Enable focal loss
+    focal_gamma: float = 2.0,         # Focusing parameter (higher = more focus)
     # Legacy v1.x params (only used if use_hybrid_weights=False)
     motion_weight: float = 4.0,
     continuous_bonus: float = 2.0,
@@ -187,42 +282,42 @@ def train_world_model_hires(
     os.makedirs(run_dir, exist_ok=True)
     print(f"Run directory: {run_dir}")
     
-    # Save run config for reproducibility
-    run_config = {
-        'timestamp': timestamp,
-        'training': {
-            'n_epochs': n_epochs,
-            'batch_size': batch_size,
-            'learning_rate': learning_rate,
-            'max_batches': max_batches,
-            'full_val_every': full_val_every,
-            'rollout_steps': rollout_steps,
-            'rollout_ratio': rollout_ratio,
-            'resume': resume,
-        },
-        'model': {
-            'd_model': 256,
-            'n_heads': 8,
-            'n_layers': 10,
-            'dropout': 0.1,
-            'history_len': 4,
-        },
-        'weighting': {
-            'use_hybrid': use_hybrid_weights,
-            # v2.0 hybrid params
-            'motion_scale': motion_scale,
-            'eventness_scale': eventness_scale,
-            'persistence_scale': persistence_scale,
-            'max_ratio': max_ratio,
-            # Legacy v1.x params
-            'motion_weight': motion_weight,
-            'continuous_bonus': continuous_bonus,
-            'max_weight': max_weight,
-            'step_discount': 0.7,
-        },
-    }
-    with open(f"{run_dir}/config.json", 'w') as f:
-        json.dump(run_config, f, indent=2)
+    # Save run config for reproducibility (using new config system)
+    run_config = WorldModelConfig()
+    run_config.timestamp = timestamp
+    run_config.run_dir = run_dir
+    run_config.vqvae_path = f"{base_dir}/atari_vqvae_hires.pt"
+    
+    # Training params
+    run_config.training.n_epochs = n_epochs
+    run_config.training.batch_size = batch_size
+    run_config.training.learning_rate = learning_rate
+    run_config.training.max_batches = max_batches
+    run_config.training.full_val_every = full_val_every
+    run_config.training.rollout_steps = rollout_steps
+    run_config.training.rollout_ratio = rollout_ratio
+    run_config.training.teacher_forcing_prob = teacher_forcing_prob
+    
+    # Model params (hardcoded for now, loaded from VQ-VAE later)
+    run_config.model.d_model = 256
+    run_config.model.n_heads = 8
+    run_config.model.n_layers = 10
+    run_config.model.dropout = 0.1
+    run_config.model.history_len = 4
+    
+    # Weighting params
+    run_config.weighting.use_hybrid = use_hybrid_weights
+    run_config.weighting.use_focal_loss = use_focal_loss
+    run_config.weighting.focal_gamma = focal_gamma
+    run_config.weighting.motion_scale = motion_scale
+    run_config.weighting.eventness_scale = eventness_scale
+    run_config.weighting.persistence_scale = persistence_scale
+    run_config.weighting.max_ratio = max_ratio
+    run_config.weighting.motion_weight = motion_weight
+    run_config.weighting.continuous_bonus = continuous_bonus
+    run_config.weighting.max_weight = max_weight
+    
+    run_config.save(f"{run_dir}/config.json")
     print(f"  Config saved to {run_dir}/config.json")
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -450,42 +545,47 @@ def train_world_model_hires(
     # === Resume from checkpoint if requested ===
     start_epoch = 0
     best_val_acc = 0
+    best_fast_val_acc = 0  # Track best fast_val for checkpointing
     history = {'train_loss': [], 'train_acc': [], 'fast_val_loss': [], 'fast_val_acc': [], 'entropy': [], 'max_prob': [], 'its': [], 'gpu_mem': [], 'val_loss': [], 'val_acc': [], 'val_epochs': []}
     
+    resumed_from_path = None
     if resume:
-        ckpt_path = f"{base_dir}/atari_world_model_hires.pt"  # Resume from base_dir
+        # Use explicit resume_path if provided, otherwise fall back to base_dir
+        if resume_path:
+            ckpt_path = resume_path
+        else:
+            ckpt_path = f"{base_dir}/atari_world_model_hires.pt"  # Resume from base_dir
+        
         if os.path.exists(ckpt_path):
             print(f"\n  Loading checkpoint from {ckpt_path}...")
             ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
             model.load_state_dict(ckpt['model_state_dict'])
             start_epoch = ckpt.get('epoch', 0) + 1
             best_val_acc = ckpt.get('val_acc', 0)
-            print(f"  Resuming from epoch {start_epoch}, best_val_acc={best_val_acc:.1f}%")
+            best_fast_val_acc = ckpt.get('fast_val_acc', 0)
+            resumed_from_path = ckpt_path
+            print(f"  Resuming from epoch {start_epoch}, best_fast_val_acc={best_fast_val_acc:.1f}%")
         else:
             print(f"  No checkpoint found at {ckpt_path}, starting fresh")
     
-    # Update config with runtime info
-    run_config['vqvae'] = {
-        'input_h': input_h,
-        'input_w': input_w,
-        'n_embeddings': n_embeddings,
-        'token_h': token_h,
-        'token_w': token_w,
-        'n_tokens': n_tokens,
-    }
-    run_config['dataset'] = {
-        'total_frames': len(all_tokens),
-        'train_samples': len(train_indices),
-        'val_samples': len(val_indices),
-        'n_actions': n_actions,
-    }
-    run_config['model']['n_vocab'] = n_embeddings
-    run_config['model']['n_actions'] = n_actions
-    run_config['model']['parameters'] = sum(p.numel() for p in model.parameters())
+    # Update config with runtime info from VQ-VAE and model
+    run_config.model.n_vocab = n_embeddings
+    run_config.model.n_actions = n_actions
+    run_config.model.token_h = token_h
+    run_config.model.token_w = token_w
     
     # Re-save config with full info
-    with open(f"{run_dir}/config.json", 'w') as f:
-        json.dump(run_config, f, indent=2)
+    run_config.save(f"{run_dir}/config.json")
+    
+    # Write session header to stats file
+    _write_session_header(
+        save_dir=run_dir,
+        start_epoch=start_epoch + 1,
+        end_epoch=start_epoch + n_epochs,
+        resumed_from=resumed_from_path,
+        resumed_epoch=start_epoch if resumed_from_path else None,
+        resumed_acc=best_fast_val_acc if resumed_from_path else None
+    )
     
     # === Training ===
     print("\n" + "=" * 60)
@@ -551,13 +651,15 @@ def train_world_model_hires(
                 with torch.amp.autocast('cuda'):
                     loss, step_accs = multistep_rollout_loss(
                         model, ms_hist, ms_acts, ms_targets, device,
-                        teacher_forcing_prob=0.1,  # v2.1: prevent ball death spiral
-                        token_embedding=model.token_embed,
+                        teacher_forcing_prob=teacher_forcing_prob,
+                        token_embedding=vqvae.quantizer.embedding,  # VQ-VAE codebook (stable, visual similarity)
                         use_importance_weights=use_hybrid_weights,
                         motion_scale=motion_scale,
                         eventness_scale=eventness_scale,
                         persistence_scale=persistence_scale,
                         max_ratio=max_ratio,
+                        use_focal_loss=use_focal_loss,
+                        focal_gamma=focal_gamma,
                     )
                 
                 optimizer.zero_grad()
@@ -584,7 +686,7 @@ def train_world_model_hires(
                     # v2.0: Compute hybrid token importance weights
                     token_weights = compute_token_importance_weights(
                         batch_target, batch_hist, device,
-                        token_embedding=model.token_embed,
+                        token_embedding=vqvae.quantizer.embedding,  # VQ-VAE codebook (stable, visual similarity)
                         use_hybrid=use_hybrid_weights,
                         # v2.0 hybrid params
                         motion_scale=motion_scale,
@@ -597,14 +699,20 @@ def train_world_model_hires(
                         max_weight=max_weight,
                     )
                     
-                    # Weighted cross-entropy
-                    ce_per_token = F.cross_entropy(
-                        logits.view(-1, model.n_vocab),
-                        batch_target.view(-1),
-                        reduction='none'
-                    ).view_as(batch_target)  # (B, N)
-                    
-                    loss = (ce_per_token * token_weights).mean()
+                    # v3.0: Focal loss + motion weights (or standard weighted CE)
+                    if use_focal_loss:
+                        # Focal loss automatically upweights hard tokens
+                        loss = focal_loss_with_motion_weights(
+                            logits, batch_target, token_weights, gamma=focal_gamma
+                        )
+                    else:
+                        # Standard weighted cross-entropy
+                        ce_per_token = F.cross_entropy(
+                            logits.reshape(-1, model.n_vocab),
+                            batch_target.reshape(-1),
+                            reduction='none'
+                        ).reshape_as(batch_target)  # (B, N)
+                        loss = (ce_per_token * token_weights).mean()
                 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -619,8 +727,8 @@ def train_world_model_hires(
                 train_correct += (preds == batch_target).sum().item()
                 train_total += batch_target.numel()
                 
-                # Free single-step tensors
-                del loss, logits, preds, token_weights, ce_per_token
+                # Free single-step tensors (ce_per_token only exists in non-focal path)
+                del loss, logits, preds, token_weights
             
             batch_count += 1
             
@@ -699,6 +807,34 @@ def train_world_model_hires(
         avg_entropy = entropy_sum / n_entropy_samples
         avg_max_prob = max_prob_sum / n_entropy_samples
         
+        # === Save best checkpoint based on fast_val_acc ===
+        if fast_val_acc > best_fast_val_acc:
+            best_fast_val_acc = fast_val_acc
+            torch.save({
+                'epoch': actual_epoch,
+                'model_state_dict': model.state_dict(),
+                'fast_val_acc': fast_val_acc,
+                'fast_val_loss': fast_val_loss,
+                'n_actions': n_actions,
+                'n_vocab': n_embeddings,
+                'token_h': token_h,
+                'token_w': token_w,
+                'n_layers': 10,
+            }, f"{run_dir}/atari_world_model_best.pt")
+            # Also copy to base_dir for easy access
+            torch.save({
+                'epoch': actual_epoch,
+                'model_state_dict': model.state_dict(),
+                'fast_val_acc': fast_val_acc,
+                'fast_val_loss': fast_val_loss,
+                'n_actions': n_actions,
+                'n_vocab': n_embeddings,
+                'token_h': token_h,
+                'token_w': token_w,
+                'n_layers': 10,
+            }, f"{base_dir}/atari_world_model_best.pt")
+            print(f"  * New BEST! fast_val_acc={fast_val_acc:.2f}% (epoch {actual_epoch+1})")
+        
         # === Gold Eval: Full validation every N epochs (for checkpointing) ===
         # Set full_val_every=999 to disable during quick iteration
         do_full_val = (epoch + 1) % full_val_every == 0
@@ -768,6 +904,23 @@ def train_world_model_hires(
         history['its'].append(epoch_its)
         history['gpu_mem'].append(gpu_mem_gb)
         
+        # Write epoch stats to text file
+        epoch_stats = {
+            'train_loss': train_loss,
+            'train_acc': train_acc,
+            'val_loss': fast_val_loss,
+            'val_acc': fast_val_acc,
+            'entropy': avg_entropy,
+            'max_prob': avg_max_prob,
+            'its': epoch_its,
+            'gpu_mem': gpu_mem_gb,
+        }
+        is_new_best = (fast_val_acc >= best_fast_val_acc)
+        _write_epoch_stats(actual_epoch + 1, epoch_stats, run_dir, is_best=is_new_best)
+        
+        # Update training plot every epoch (cheap - ~0.1s)
+        _plot_training(history, run_dir)
+        
         # === Checkpoint strategy ===
         # 1. Always save 'latest' every epoch (for resuming)
         torch.save({
@@ -802,6 +955,10 @@ def train_world_model_hires(
     # Plot training
     _plot_training(history, run_dir)
     
+    # Generate rollout visualization
+    _plot_rollout_comparison(model, vqvae, val_dataset, device, run_dir, 
+                            rollout_steps=min(rollout_steps, 8))
+    
     print("\n" + "=" * 60)
     print(f"Training complete! Best GOLD score: {best_val_acc:.1f}%")
     print(f"  (GOLD = 50% 1-step acc + 50% rollout avg)")
@@ -809,6 +966,46 @@ def train_world_model_hires(
     print(f"  Latest:          {run_dir}/atari_world_model_hires.pt")
     print(f"  Best:            {run_dir}/atari_world_model_best_full.pt")
     print("=" * 60)
+
+
+def _write_session_header(save_dir: str, start_epoch: int, end_epoch: int, 
+                          resumed_from: str = None, resumed_epoch: int = None,
+                          resumed_acc: float = None):
+    """Write a session header to the stats file when training starts/resumes."""
+    from datetime import datetime
+    stats_file = os.path.join(save_dir, "training_stats.txt")
+    
+    with open(stats_file, 'a') as f:
+        f.write("\n" + "=" * 80 + "\n")
+        f.write(f"Training Session - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        if resumed_from:
+            f.write(f"  RESUMED FROM: {resumed_from}\n")
+            f.write(f"  Resume Epoch: {resumed_epoch}, Acc: {resumed_acc:.2f}%\n")
+        else:
+            f.write("  NEW TRAINING RUN\n")
+        f.write(f"  Epochs: {start_epoch} -> {end_epoch}\n")
+        f.write("=" * 80 + "\n\n")
+
+
+def _write_epoch_stats(epoch: int, stats: dict, save_dir: str, is_best: bool = False):
+    """Write epoch stats to a text file for easy review."""
+    stats_file = os.path.join(save_dir, "training_stats.txt")
+    
+    # Create header if file doesn't exist
+    if not os.path.exists(stats_file):
+        with open(stats_file, 'w') as f:
+            f.write("=" * 80 + "\n")
+            f.write("Training Statistics Log\n")
+            f.write("=" * 80 + "\n\n")
+    
+    with open(stats_file, 'a') as f:
+        best_marker = " *BEST*" if is_best else ""
+        f.write(f"Epoch {epoch}{best_marker}\n")
+        f.write(f"  Train Loss: {stats['train_loss']:.4f}  |  Train Acc: {stats['train_acc']:.2f}%\n")
+        f.write(f"  Val Loss:   {stats['val_loss']:.4f}  |  Val Acc:   {stats['val_acc']:.2f}%\n")
+        f.write(f"  Entropy: {stats['entropy']:.3f}  |  Max Prob: {stats['max_prob']:.3f}\n")
+        f.write(f"  Speed: {stats['its']:.1f} it/s  |  GPU Mem: {stats['gpu_mem']:.1f} GB\n")
+        f.write("-" * 40 + "\n")
 
 
 def _plot_training(history, save_dir):
@@ -890,48 +1087,227 @@ def _plot_training(history, save_dir):
     plt.close()
 
 
+def _plot_rollout_comparison(model, vqvae, val_dataset, device, save_dir, rollout_steps=5):
+    """
+    Generate visual comparison of ground truth vs model rollout predictions.
+    Shows K-step autoregressive prediction to visualize ball/dynamics quality.
+    """
+    try:
+        model.eval()
+        vqvae.eval()
+        
+        # Get token grid dimensions
+        token_h, token_w = 21, 16  # Default for 84x64
+        
+        # Handle Subset wrapper - get underlying dataset
+        base_dataset = val_dataset.dataset if hasattr(val_dataset, 'dataset') else val_dataset
+        
+        # Find a good sample (one with motion in the sequence)
+        np.random.seed(42)  # Reproducible sample selection
+        sample_idx = np.random.randint(0, len(val_dataset))
+        
+        # Get sample: history, action, target
+        history, action, target = val_dataset[sample_idx]
+        history = history.unsqueeze(0).to(device)  # (1, T, N)
+        
+        # We need K actions and K targets - get consecutive samples
+        # Access tokens/actions from base dataset (tokens are stored as 'frames' in AtariTemporalDataset)
+        tokens = base_dataset.frames  # Pre-tokenized frames
+        actions = base_dataset.actions
+        
+        # Find start index for this sample
+        start_idx = sample_idx
+        
+        # Build rollout data
+        K = min(rollout_steps, 8)
+        
+        # Use simpler approach: just run K steps from this history
+        with torch.no_grad():
+            current_history = history.clone()
+            gt_frames = []
+            pred_frames = []
+            
+            # Get ground truth frames and run predictions
+            for k in range(K):
+                # Get action for this step (use random if not available)
+                if start_idx + k < len(actions):
+                    action_k = actions[start_idx + k].unsqueeze(0).to(device)
+                else:
+                    action_k = torch.randint(0, 4, (1,), device=device)
+                
+                # Get ground truth target
+                target_idx = base_dataset.frame_index[start_idx] + k + 1 if hasattr(base_dataset, 'frame_index') else start_idx + k + 1
+                if target_idx < len(tokens):
+                    gt_tok = tokens[target_idx]
+                    # Handle both (H*W,) and (H, W) shapes
+                    if gt_tok.ndim == 1:
+                        gt_tokens = gt_tok.reshape(1, token_h, token_w).to(device)
+                    else:
+                        gt_tokens = gt_tok.unsqueeze(0).to(device)
+                else:
+                    gt_tok = tokens[-1]
+                    if gt_tok.ndim == 1:
+                        gt_tokens = gt_tok.reshape(1, token_h, token_w).to(device)
+                    else:
+                        gt_tokens = gt_tok.unsqueeze(0).to(device)
+                
+                # Decode ground truth
+                gt_frame = vqvae.decode(gt_tokens)  # (1, C, H, W)
+                gt_img = gt_frame.squeeze().cpu().numpy()  # (C, H, W)
+                if gt_img.ndim == 3:
+                    gt_img = np.transpose(gt_img, (1, 2, 0))  # (H, W, C) for matplotlib
+                    gt_img = (gt_img + 1) / 2  # [-1, 1] -> [0, 1]
+                    gt_img = np.clip(gt_img, 0, 1)
+                gt_frames.append(gt_img)
+                
+                # Model prediction
+                logits, _ = model(current_history, action_k, None)
+                pred_tokens = logits.argmax(dim=-1)  # (1, N)
+                
+                # Decode prediction
+                pred_tokens_2d = pred_tokens.reshape(1, token_h, token_w)
+                pred_frame = vqvae.decode(pred_tokens_2d)  # (1, C, H, W)
+                pred_img = pred_frame.squeeze().cpu().numpy()  # (C, H, W)
+                if pred_img.ndim == 3:
+                    pred_img = np.transpose(pred_img, (1, 2, 0))  # (H, W, C) for matplotlib
+                    pred_img = (pred_img + 1) / 2  # [-1, 1] -> [0, 1]
+                    pred_img = np.clip(pred_img, 0, 1)
+                pred_frames.append(pred_img)
+                
+                # Update history with prediction (autoregressive)
+                new_history = current_history.roll(shifts=-1, dims=1)
+                new_history[:, -1, :] = pred_tokens
+                current_history = new_history
+        
+        # Create visualization: 2 rows (GT, Pred) x K columns
+        fig, axes = plt.subplots(2, K, figsize=(K * 2, 4))
+        
+        if K == 1:
+            axes = axes.reshape(2, 1)
+        
+        for k in range(K):
+            # Ground truth row
+            axes[0, k].imshow(gt_frames[k])
+            axes[0, k].set_title(f't+{k+1}' if k == 0 else f'+{k+1}')
+            axes[0, k].axis('off')
+            if k == 0:
+                axes[0, k].set_ylabel('Ground Truth', fontsize=10)
+            
+            # Prediction row
+            axes[1, k].imshow(pred_frames[k])
+            axes[1, k].axis('off')
+            if k == 0:
+                axes[1, k].set_ylabel('Model Pred', fontsize=10)
+        
+        # Add row labels
+        fig.text(0.02, 0.75, 'Ground\nTruth', ha='center', va='center', fontsize=10, fontweight='bold')
+        fig.text(0.02, 0.25, 'Model\nPred', ha='center', va='center', fontsize=10, fontweight='bold')
+        
+        plt.suptitle(f'{K}-Step Autoregressive Rollout Comparison', fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/rollout_comparison.png", dpi=150, bbox_inches='tight')
+        plt.close()
+        print(f"  Rollout comparison saved to {save_dir}/rollout_comparison.png")
+    except Exception as e:
+        print(f"  [WARNING] Could not generate rollout comparison: {e}")
+
+
 if __name__ == "__main__":
     import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--epochs', type=int, default=30)
-    parser.add_argument('--batch-size', type=int, default=8, help='Batch size for training')
-    parser.add_argument('--lr', type=float, default=5e-4, help='Learning rate')
-    parser.add_argument('--max-batches', type=int, default=100, help='Max batches per epoch (0=all)')
-    parser.add_argument('--resume', action='store_true', help='Resume from best checkpoint')
-    parser.add_argument('--full-val-every', type=int, default=999, help='Full validation every N epochs (999=disabled)')
-    # v1.3: Multi-step rollout training
-    parser.add_argument('--rollout-steps', type=int, default=3, help='K steps to unroll (0 = disabled)')
-    parser.add_argument('--rollout-ratio', type=float, default=0.3, help='Fraction of batches to use multi-step')
-    # v2.0: Hybrid importance weighting
-    parser.add_argument('--use-hybrid', action='store_true', default=True, help='Use hybrid v2.0 weighting (default: True)')
+    from config import WorldModelConfig
+    
+    parser = argparse.ArgumentParser(
+        description='Train World Model with configurable hyperparameters',
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    
+    # All args use None as default so we can detect explicit overrides
+    parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')
+    parser.add_argument('--batch-size', type=int, default=None, help='Batch size for training')
+    parser.add_argument('--lr', type=float, default=None, help='Learning rate')
+    parser.add_argument('--max-batches', type=int, default=None, help='Max batches per epoch (0=all)')
+    parser.add_argument('--resume', action='store_true', help='Resume from checkpoint')
+    parser.add_argument('--from-run', type=str, default=None, 
+                        help='Run directory to resume from (e.g., "20260110_111307" or "latest")')
+    parser.add_argument('--from-checkpoint', type=str, default=None,
+                        help='Checkpoint within run (e.g., "best", "epoch240"). Default: latest epoch')
+    parser.add_argument('--full-val-every', type=int, default=None, help='Full validation every N epochs')
+    
+    # Multi-step rollout training
+    parser.add_argument('--rollout-steps', type=int, default=None, help='K steps to unroll (0=disabled)')
+    parser.add_argument('--rollout-ratio', type=float, default=None, help='Fraction of batches for multi-step')
+    parser.add_argument('--teacher-forcing', type=float, default=None, help='Teacher forcing probability')
+    
+    # Hybrid importance weighting
+    parser.add_argument('--use-hybrid', action='store_true', default=None, help='Use hybrid v2.0 weighting')
     parser.add_argument('--no-hybrid', dest='use_hybrid', action='store_false', help='Use legacy v1.x weighting')
-    parser.add_argument('--motion-scale', type=float, default=2.0, help='Embedding-distance motion boost (default: 2.0)')
-    parser.add_argument('--eventness-scale', type=float, default=2.0, help='Spike detection boost for fire/spawn (default: 2.0)')
-    parser.add_argument('--persistence-scale', type=float, default=1.0, help='Multi-frame consistency boost (default: 1.0)')
-    parser.add_argument('--max-ratio', type=float, default=6.0, help='Safe cap: 95th/median ratio limit (default: 6.0)')
-    # Legacy v1.x params (only used with --no-hybrid)
-    parser.add_argument('--motion-weight', type=float, default=4.0, help='[Legacy] Weight for moving tokens')
-    parser.add_argument('--continuous-bonus', type=float, default=2.0, help='[Legacy] Bonus for continuous motion')
-    parser.add_argument('--max-weight', type=float, default=8.0, help='[Legacy] Maximum weight cap')
+    parser.add_argument('--motion-scale', type=float, default=None, help='Embedding-distance motion boost')
+    parser.add_argument('--eventness-scale', type=float, default=None, help='Spike detection boost')
+    parser.add_argument('--persistence-scale', type=float, default=None, help='Multi-frame consistency boost')
+    parser.add_argument('--max-ratio', type=float, default=None, help='Safe cap: 95th/median ratio limit')
+    
+    # v3.0: Focal loss
+    parser.add_argument('--focal-loss', action='store_true', default=None, help='Enable focal loss (default: True)')
+    parser.add_argument('--no-focal-loss', dest='focal_loss', action='store_false', help='Disable focal loss')
+    parser.add_argument('--focal-gamma', type=float, default=None, help='Focal loss gamma (higher=more focus on hard)')
+    
+    # Legacy v1.x params
+    parser.add_argument('--motion-weight', type=float, default=None, help='[Legacy] Weight for moving tokens')
+    parser.add_argument('--continuous-bonus', type=float, default=None, help='[Legacy] Bonus for continuous motion')
+    parser.add_argument('--max-weight', type=float, default=None, help='[Legacy] Maximum weight cap')
+    
     args = parser.parse_args()
     
+    # Load defaults, then override with CLI args
+    config = WorldModelConfig()
+    config.update_from_args(args)
+    
+    # Handle focal loss args
+    if args.focal_loss is not None:
+        config.weighting.use_focal_loss = args.focal_loss
+    if args.focal_gamma is not None:
+        config.weighting.focal_gamma = args.focal_gamma
+    
+    # Resolve resume path if --from-run specified
+    resume_path = None
+    if args.from_run:
+        args.resume = True  # Automatically enable resume if --from-run specified
+        resume_path = resolve_resume_path(args.from_run, args.from_checkpoint)
+        print(f"\n  Resume from: {resume_path}")
+    
+    # Print effective config
+    print("\n" + "=" * 60)
+    print("Effective Configuration (defaults + CLI overrides)")
+    print("=" * 60)
+    print(f"  Training: epochs={config.training.n_epochs}, batch={config.training.batch_size}, lr={config.training.learning_rate}")
+    print(f"  Rollout: steps={config.training.rollout_steps}, ratio={config.training.rollout_ratio}, tf={config.training.teacher_forcing_prob}")
+    print(f"  Weighting: hybrid={config.weighting.use_hybrid}, motion={config.weighting.motion_scale}, max_ratio={config.weighting.max_ratio}")
+    print(f"  Focal Loss: enabled={config.weighting.use_focal_loss}, gamma={config.weighting.focal_gamma}")
+    print("=" * 60 + "\n")
+    
     train_world_model_hires(
-        n_epochs=args.epochs,
-        batch_size=args.batch_size,
-        learning_rate=args.lr,
-        max_batches=args.max_batches,
-        resume=args.resume, 
-        full_val_every=args.full_val_every,
-        rollout_steps=args.rollout_steps,
-        rollout_ratio=args.rollout_ratio,
+        n_epochs=config.training.n_epochs,
+        batch_size=config.training.batch_size,
+        learning_rate=config.training.learning_rate,
+        max_batches=config.training.max_batches,
+        resume=args.resume,
+        resume_path=resume_path,
+        full_val_every=config.training.full_val_every,
+        rollout_steps=config.training.rollout_steps,
+        rollout_ratio=config.training.rollout_ratio,
         # v2.0 hybrid weighting
-        use_hybrid_weights=args.use_hybrid,
-        motion_scale=args.motion_scale,
-        eventness_scale=args.eventness_scale,
-        persistence_scale=args.persistence_scale,
-        max_ratio=args.max_ratio,
+        use_hybrid_weights=config.weighting.use_hybrid,
+        motion_scale=config.weighting.motion_scale,
+        eventness_scale=config.weighting.eventness_scale,
+        persistence_scale=config.weighting.persistence_scale,
+        max_ratio=config.weighting.max_ratio,
+        # v2.1 teacher forcing
+        teacher_forcing_prob=config.training.teacher_forcing_prob,
+        # v3.0 focal loss
+        use_focal_loss=config.weighting.use_focal_loss,
+        focal_gamma=config.weighting.focal_gamma,
         # Legacy v1.x params
-        motion_weight=args.motion_weight,
-        continuous_bonus=args.continuous_bonus,
-        max_weight=args.max_weight,
+        motion_weight=config.weighting.motion_weight,
+        continuous_bonus=config.weighting.continuous_bonus,
+        max_weight=config.weighting.max_weight,
     )

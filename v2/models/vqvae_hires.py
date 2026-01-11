@@ -453,6 +453,7 @@ class VectorQuantizerHiRes(nn.Module):
         v2.1: Compute codebook statistics using histogram.
         
         v2.2: Now also includes EMA-based dead code count for debugging.
+        v2.22: Fixed memory leak - compute on CPU and delete intermediates.
         
         Returns:
             dict with:
@@ -462,46 +463,43 @@ class VectorQuantizerHiRes(nn.Module):
             - dead_codes: number of completely unused codes
             - ema_dead_codes: dead codes according to EMA stats (for debugging)
         """
-        if indices is not None:
-            # Compute from provided indices
-            counts = torch.bincount(indices.flatten(), minlength=self.n_embeddings).float()
-        else:
-            # Use accumulated usage counts
-            counts = self.usage_counts
+        import numpy as np
         
-        total = counts.sum()
-        if total == 0:
-            return {'usage_pct': 0.0, 'perplexity': 0.0, 'entropy': 0.0, 'dead_codes': self.n_embeddings}
-        
-        probs = counts / total
-        probs_nonzero = probs[probs > 0]
-        
-        # Usage percentage (codes used at least once)
-        usage_pct = (counts > 0).float().mean().item() * 100
-        
-        # Entropy: -sum(p * log(p))
-        entropy = -torch.sum(probs_nonzero * torch.log(probs_nonzero + 1e-10)).item()
-        
-        # Perplexity: exp(entropy) - effective number of codes
-        perplexity = torch.exp(torch.tensor(entropy)).item()
-        
-        # Dead codes count (from batch/epoch counts)
-        dead_codes = (counts == 0).sum().item()
-        
-        # v2.2: Also check EMA stats for true dead codes
-        ema_total = self.ema_cluster_size.sum()
-        if ema_total > 0:
-            ema_usage_pct = self.ema_cluster_size / ema_total
-            ema_dead = (ema_usage_pct < self.dead_code_threshold).sum().item()
-        else:
-            ema_dead = self.n_embeddings
+        # v2.22: Compute on CPU to avoid GPU memory accumulation
+        with torch.no_grad():
+            if indices is not None:
+                counts_cpu = torch.bincount(indices.flatten(), minlength=self.n_embeddings).cpu().numpy()
+            else:
+                counts_cpu = self.usage_counts.cpu().numpy()
+            
+            total = counts_cpu.sum()
+            if total == 0:
+                return {'usage_pct': 0.0, 'perplexity': 0.0, 'entropy': 0.0, 
+                        'dead_codes': self.n_embeddings, 'ema_dead_codes': self.n_embeddings}
+            
+            probs = counts_cpu / total
+            probs_nonzero = probs[probs > 0]
+            
+            usage_pct = float((counts_cpu > 0).mean() * 100)
+            entropy = float(-np.sum(probs_nonzero * np.log(probs_nonzero + 1e-10)))
+            perplexity = float(np.exp(entropy))
+            dead_codes = int((counts_cpu == 0).sum())
+            
+            # v2.2: EMA-based dead code count
+            ema_cpu = self.ema_cluster_size.cpu().numpy()
+            ema_total = ema_cpu.sum()
+            if ema_total > 0:
+                ema_usage_pct = ema_cpu / ema_total
+                ema_dead = int((ema_usage_pct < self.dead_code_threshold).sum())
+            else:
+                ema_dead = self.n_embeddings
         
         return {
             'usage_pct': usage_pct,
             'perplexity': perplexity,
             'entropy': entropy,
-            'dead_codes': int(dead_codes),
-            'ema_dead_codes': int(ema_dead),  # v2.2: EMA-based dead code count
+            'dead_codes': dead_codes,
+            'ema_dead_codes': ema_dead,
         }
     
     def reset_usage_counts(self):

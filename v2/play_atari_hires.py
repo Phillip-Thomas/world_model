@@ -18,6 +18,7 @@ Usage:
     python play_atari_hires.py --run 20260108_164547 --checkpoint epoch20
 """
 
+import math
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -43,6 +44,7 @@ except ImportError:
 
 from models.vqvae_hires import VQVAEHiRes
 from models.temporal_world_model import TemporalVisualWorldModel
+from config import WorldModelConfig, get_config_for_checkpoint
 from PIL import Image
 
 
@@ -122,15 +124,17 @@ def resolve_model_path(run: str = None, checkpoint: str = None, latest: bool = F
         run_path = os.path.join(base_path, RUNS_DIR, run_name)
         
         if checkpoint:
-            # Specific checkpoint requested
-            ckpt_name = f"atari_world_model_hires_{checkpoint}.pt"
-            ckpt_path = os.path.join(run_path, ckpt_name)
-            if not os.path.exists(ckpt_path):
-                # Try without prefix
-                ckpt_path = os.path.join(run_path, f"{checkpoint}.pt")
-            if not os.path.exists(ckpt_path):
-                raise FileNotFoundError(f"Checkpoint not found: {ckpt_name} in {run_path}")
-            return ckpt_path
+            # Specific checkpoint requested - try multiple naming conventions
+            candidates = [
+                f"atari_world_model_hires_{checkpoint}.pt",  # epoch checkpoints
+                f"atari_world_model_{checkpoint}.pt",         # best checkpoint
+                f"{checkpoint}.pt",                           # direct name
+            ]
+            for ckpt_name in candidates:
+                ckpt_path = os.path.join(run_path, ckpt_name)
+                if os.path.exists(ckpt_path):
+                    return ckpt_path
+            raise FileNotFoundError(f"Checkpoint not found: {checkpoint} in {run_path}\n  Tried: {candidates}")
         else:
             # Find latest checkpoint in run
             return get_latest_checkpoint(run_name)
@@ -148,16 +152,35 @@ class AtariWorldPlayerHiRes:
         vqvae_path: str = "checkpoints/v2/atari/atari_vqvae_hires.pt",
         model_path: str = "checkpoints/v2/atari/atari_world_model_hires.pt",
         device: str = 'cuda',
-        deterministic: bool = True,  # Use greedy argmax by default
-        temperature: float = 0.8,    # Only used if deterministic=False
-        top_k: int = 5,              # Only used if deterministic=False
+        config: WorldModelConfig = None,  # Load from run dir if None
+        # CLI overrides (None = use config value)
+        deterministic: bool = None,
+        temperature: float = None,
+        top_k: int = None,
+        logit_smoothing: float = None,
+        n_candidates: int = None,
+        adaptive_temp: bool = None,
+        temp_boost: float = None,
     ):
-        self.deterministic = deterministic
-        self.temperature = temperature
-        self.top_k = top_k
+        # Load config from checkpoint's run directory if not provided
+        if config is None:
+            config = get_config_for_checkpoint(model_path)
+        self.config = config
+        
+        # Use config values, with CLI overrides taking precedence
+        self.deterministic = deterministic if deterministic is not None else config.inference.deterministic
+        self.temperature = temperature if temperature is not None else config.inference.temperature
+        self.top_k = top_k if top_k is not None else config.inference.top_k
+        
+        # Advanced inference settings (with config defaults)
+        self.logit_smoothing = logit_smoothing if logit_smoothing is not None else getattr(config.inference, 'logit_smoothing', 0.0)
+        self.n_candidates = n_candidates if n_candidates is not None else getattr(config.inference, 'n_candidates', 1)
+        self.adaptive_temp = adaptive_temp if adaptive_temp is not None else getattr(config.inference, 'adaptive_temp', False)
+        self.temp_boost = temp_boost if temp_boost is not None else getattr(config.inference, 'temp_boost', 0.3)
+        
         self.device = device
         self.game = game
-        self.history_len = 4
+        self.history_len = config.model.history_len
         
         # Load models
         print("Loading high-res models...")
@@ -179,9 +202,11 @@ class AtariWorldPlayerHiRes:
         # State
         self.real_frame = None
         self.ai_frame = None
-        self.frame_history = []
+        self.frame_history = []      # Image history (for display only)
+        self.token_history = None    # Token history for world model (avoids decode->encode round-trip)
         self.divergence = deque(maxlen=500)  # Rolling window to prevent memory growth
-        self.step_count = 0
+        self.step_count = 0  # Frames since last reset (AI divergence tracking)
+        self.total_frames = 0  # Total frames played (never resets)
         
         # Frame timing (Atari 60 FPS with frameskip=4 = 15 FPS effective)
         self.target_fps = 15.0
@@ -190,6 +215,9 @@ class AtariWorldPlayerHiRes:
         self.paused = False
         self.anim = None
         
+        # Logit smoothing state (reduces mode-hopping/flicker)
+        self.prev_logits = None
+        
     def _load_vqvae(self, path: str) -> VQVAEHiRes:
         """Load VQ-VAE with flexible input size."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
@@ -197,7 +225,7 @@ class AtariWorldPlayerHiRes:
         # Get dimensions from checkpoint
         input_h = ckpt.get('input_h', 84)
         input_w = ckpt.get('input_w', 64)
-        n_embeddings = ckpt.get('n_embeddings', 32)  # Load from checkpoint
+        n_embeddings = ckpt.get('n_embeddings', 64)  # Load from checkpoint (v2.22: default to 64)
         self.input_size = (input_h, input_w)
         self.n_embeddings = n_embeddings
         
@@ -212,6 +240,9 @@ class AtariWorldPlayerHiRes:
         self.token_h = model.token_h
         self.token_w = model.token_w
         self.n_tokens = model.n_tokens
+        
+        # Store embeddings for candidate selection (embedding distance scoring)
+        self.vqvae_embeddings = model.quantizer.embedding.weight.detach()  # (n_codes, D)
         
         print(f"  Loaded VQ-VAE ({input_h}x{input_w} -> {self.token_h}x{self.token_w} tokens, {n_embeddings} codes)")
         return model
@@ -237,7 +268,22 @@ class AtariWorldPlayerHiRes:
         ).to(self.device)
         model.load_state_dict(ckpt['model_state_dict'])
         model.eval()
-        print(f"  Loaded World Model ({token_h}x{token_w}, {n_layers} layers, {n_vocab} vocab, epoch {ckpt.get('epoch', '?')}, acc={ckpt.get('val_acc', 0):.1f}%)")
+        
+        # Store checkpoint info for display
+        self.wm_epoch = ckpt.get('epoch', -1) + 1  # Convert 0-indexed to 1-indexed
+        self.wm_acc = ckpt.get('fast_val_acc', ckpt.get('val_acc', 0))
+        
+        print(f"  Loaded World Model ({token_h}x{token_w}, {n_layers} layers, {n_vocab} vocab, epoch {self.wm_epoch}, acc={self.wm_acc:.1f}%)")
+        
+        # v2.22: Validate vocab size matches VQ-VAE
+        if n_vocab != self.n_embeddings:
+            raise ValueError(
+                f"VOCAB MISMATCH: World model has {n_vocab} vocab but VQ-VAE has {self.n_embeddings} codes!\n"
+                f"  This will cause CUDA assertion errors.\n"
+                f"  Solution: Use a world model trained with the same VQ-VAE codebook size.\n"
+                f"  Current training run uses 64-code VQ-VAE - wait for it to complete."
+            )
+        
         return model, n_actions
     
     def _preprocess(self, frame: np.ndarray) -> torch.Tensor:
@@ -261,16 +307,137 @@ class AtariWorldPlayerHiRes:
         self.real_frame = self._preprocess(obs).to(self.device)
         self.ai_frame = self.real_frame.clone()
         
-        # Initialize history with current frame
+        # Initialize history with current frame (for display)
         self.frame_history = [self.real_frame.clone() for _ in range(self.history_len)]
+        
+        # Initialize TOKEN history (avoids decode->encode round-trip)
+        with torch.no_grad():
+            init_tokens = self.vqvae.encode(self.real_frame.unsqueeze(0))  # (1, H, W)
+            init_tokens_flat = init_tokens.view(1, self.n_tokens)  # (1, N)
+            self.token_history = init_tokens_flat.repeat(1, self.history_len, 1)  # (1, T, N)
+        
         self.divergence.clear()  # Clear deque instead of replacing
-        self.step_count = 0
+        self.step_count = 0  # Frames since last reset (for AI divergence tracking)
+        # Note: total_frames is NOT reset here - it tracks total real world frames
+        
+        # Reset logit smoothing state
+        self.prev_logits = None
         
     def sync_to_real(self):
-        """Sync AI frame to real frame."""
+        """Sync AI frame to real frame - complete reset of AI rollout state."""
         self.ai_frame = self.real_frame.clone()
         self.frame_history = [self.real_frame.clone() for _ in range(self.history_len)]
-        print("Synced AI to real game")
+        
+        # Sync token history too (fills all 4 history slots with current frame)
+        with torch.no_grad():
+            real_tokens = self.vqvae.encode(self.real_frame.unsqueeze(0))  # (1, H, W)
+            real_tokens_flat = real_tokens.view(1, self.n_tokens)  # (1, N)
+            self.token_history = real_tokens_flat.repeat(1, self.history_len, 1)  # (1, T, N)
+        
+        # Reset logit smoothing state
+        self.prev_logits = None
+        
+        # Reset divergence tracking - this is a fresh rollout
+        self.divergence.clear()
+        self.step_count = 0
+        
+        print("Reset AI rollout (synced to real, step=0)")
+    
+    def _sample_single(self, logits: torch.Tensor) -> torch.Tensor:
+        """Sample tokens from logits using current temperature/top-k settings."""
+        if self.deterministic:
+            return logits.argmax(dim=-1)
+        
+        # Adaptive temperature: uncertain tokens get higher temp
+        if self.adaptive_temp:
+            # Per-token confidence from logits
+            probs = F.softmax(logits, dim=-1)  # (1, N, V)
+            entropy = -(probs * (probs + 1e-10).log()).sum(dim=-1)  # (1, N)
+            max_entropy = math.log(self.n_embeddings)
+            
+            # Confidence: 0 = uncertain, 1 = certain
+            confidence = 1.0 - (entropy / max_entropy).clamp(0, 1)
+            
+            # Per-token temperature: base + boost * (1 - confidence)
+            # Confident tokens get base temp, uncertain get base + boost
+            token_temp = self.temperature + self.temp_boost * (1.0 - confidence)
+            token_temp = token_temp.unsqueeze(-1)  # (1, N, 1) for broadcasting
+            
+            scaled_logits = logits / token_temp
+        else:
+            # Fixed temperature for all tokens
+            scaled_logits = logits / self.temperature
+        
+        # Apply top-k filtering
+        if self.top_k > 0:
+            v, _ = torch.topk(scaled_logits, self.top_k, dim=-1)
+            scaled_logits[scaled_logits < v[..., -1:]] = float('-inf')
+        
+        probs = F.softmax(scaled_logits, dim=-1)
+        tokens = torch.multinomial(
+            probs.view(-1, probs.shape[-1]), num_samples=1
+        ).view(1, self.n_tokens)
+        return tokens
+    
+    def _score_candidate(self, tokens: torch.Tensor, prev_tokens: torch.Tensor) -> float:
+        """
+        Score a candidate based on continuity and embedding distance.
+        Higher score = better candidate.
+        
+        Game-agnostic scoring:
+        - Token continuity: prefer candidates with reasonable change rate
+        - Embedding distance: prefer small visual changes (smooth transitions)
+        """
+        # Token continuity: fraction of tokens that stayed the same
+        same_mask = (tokens == prev_tokens).float()
+        continuity = same_mask.mean().item()
+        
+        # Change rate (5-15% change per frame is typical for game dynamics)
+        change_rate = 1.0 - continuity
+        ideal_change = 0.08  # ~8% of tokens should change
+        change_penalty = abs(change_rate - ideal_change)
+        
+        # Embedding distance for changed tokens (small = smooth transition)
+        if change_rate > 0.001:  # Only if something changed
+            changed_mask = ~same_mask.bool().squeeze()
+            if changed_mask.any():
+                curr_emb = self.vqvae_embeddings[tokens.squeeze()[changed_mask]]
+                prev_emb = self.vqvae_embeddings[prev_tokens.squeeze()[changed_mask]]
+                emb_dist = (curr_emb - prev_emb).norm(dim=-1).mean().item()
+            else:
+                emb_dist = 0.0
+        else:
+            emb_dist = 0.0
+        
+        # Combined score (higher = better)
+        # Penalize large change rates and large embedding distances
+        score = -change_penalty * 10.0 - emb_dist * 0.1
+        
+        return score
+    
+    def _sample_with_candidates(self, logits: torch.Tensor) -> torch.Tensor:
+        """
+        Sample N candidates and pick the best one based on continuity scoring.
+        
+        This is game-agnostic: uses token-level continuity and embedding distance,
+        not object detection or game-specific heuristics.
+        """
+        prev_tokens = self.token_history[:, -1, :]  # (1, N) - last frame
+        
+        if self.n_candidates <= 1 or self.deterministic:
+            # No candidate selection - just sample once
+            return self._sample_single(logits)
+        
+        # Sample N candidates
+        candidates = []
+        for _ in range(self.n_candidates):
+            tokens = self._sample_single(logits)
+            score = self._score_candidate(tokens, prev_tokens)
+            candidates.append((score, tokens))
+        
+        # Pick best candidate
+        best_tokens = max(candidates, key=lambda x: x[0])[1]
+        return best_tokens
         
     def step(self, action: int):
         """Step both real game and AI model."""
@@ -278,44 +445,30 @@ class AtariWorldPlayerHiRes:
         obs, reward, terminated, truncated, info = self.env.step(action)
         self.real_frame = self._preprocess(obs).to(self.device)
         
-        # AI prediction
+        # AI prediction using TOKEN history (no decode->encode round-trip!)
         with torch.no_grad():
-            # Build history tokens
-            history = torch.stack(self.frame_history[-self.history_len:]).to(self.device)
-            history = history.unsqueeze(0)  # (1, T, C, H, W)
-            
-            # Tokenize history
-            B, T = history.shape[:2]
-            hist_tokens = []
-            for t in range(T):
-                tok = self.vqvae.encode(history[:, t])  # (1, token_h, token_w)
-                hist_tokens.append(tok.view(B, self.n_tokens))  # Flatten
-            hist_tokens = torch.stack(hist_tokens, dim=1)  # (1, T, n_tokens)
-            
-            # Predict next tokens
+            # Predict next tokens directly from token history
             action_tensor = torch.tensor([action], device=self.device)
-            logits, _ = self.world_model(hist_tokens, action_tensor, None)
+            logits, _ = self.world_model(self.token_history, action_tensor, None)
             
-            if self.deterministic:
-                # Greedy argmax - most stable, no randomness
-                pred_tokens = logits.argmax(dim=-1)  # (1, n_tokens)
-            else:
-                # Temperature sampling with optional top-k
-                logits = logits / self.temperature
-                if self.top_k > 0:
-                    v, _ = torch.topk(logits, self.top_k, dim=-1)
-                    logits[logits < v[..., -1:]] = float('-inf')
-                
-                probs = F.softmax(logits, dim=-1)
-                pred_tokens = torch.multinomial(
-                    probs.view(-1, probs.shape[-1]), num_samples=1
-                ).view(1, self.n_tokens)
+            # Logit smoothing: blend with previous logits to reduce mode-hopping/flicker
+            if self.logit_smoothing > 0 and self.prev_logits is not None:
+                alpha = self.logit_smoothing
+                logits = (1 - alpha) * logits + alpha * self.prev_logits
+            self.prev_logits = logits.clone()
             
-            # Decode to image
-            pred_tokens = pred_tokens.view(1, self.token_h, self.token_w)
-            self.ai_frame = self.vqvae.decode(pred_tokens).squeeze(0)
+            # Sample tokens (with optional candidate selection)
+            pred_tokens = self._sample_with_candidates(logits)
+            
+            # Update token history efficiently (roll + replace last)
+            self.token_history = self.token_history.roll(shifts=-1, dims=1)
+            self.token_history[:, -1, :] = pred_tokens
+            
+            # Decode to image for display only
+            pred_tokens_2d = pred_tokens.view(1, self.token_h, self.token_w)
+            self.ai_frame = self.vqvae.decode(pred_tokens_2d).squeeze(0)
         
-        # Update history with AI frame
+        # Update image history (for display only, not used in prediction)
         self.frame_history.append(self.ai_frame.clone())
         if len(self.frame_history) > self.history_len * 2:
             self.frame_history = self.frame_history[-self.history_len * 2:]
@@ -325,6 +478,7 @@ class AtariWorldPlayerHiRes:
         self.divergence.append(div)
         
         self.step_count += 1
+        self.total_frames += 1
         
         return terminated or truncated
     
@@ -410,8 +564,8 @@ class AtariWorldPlayerHiRes:
                 ax_div.autoscale_view(scalex=False, scaley=True)
             
             div_text = f" | Div: {self.divergence[-1]:.1f}" if self.divergence else ""
-            ax_real.set_title(f"REAL ATARI | Step {self.step_count}", fontsize=12, fontweight='bold')
-            ax_ai.set_title(f"AI WORLD MODEL ({self.token_h}x{self.token_w}){div_text}", 
+            ax_real.set_title(f"REAL ATARI | Frame {self.total_frames}", fontsize=12, fontweight='bold')
+            ax_ai.set_title(f"AI (Epoch {self.wm_epoch}, {self.wm_acc:.1f}%) | Since Reset: {self.step_count}{div_text}", 
                            fontsize=12, fontweight='bold')
             
             if done:
@@ -448,6 +602,9 @@ Examples:
   python play_atari_hires.py --latest              # Latest checkpoint from latest run
   python play_atari_hires.py --run 20260108_164547 # Latest checkpoint from specific run  
   python play_atari_hires.py --run 20260108_164547 --checkpoint epoch20
+
+Inference settings are loaded from the run's config.json by default.
+Use --stochastic, --temperature, --top-k to override.
         """
     )
     
@@ -461,13 +618,26 @@ Examples:
     parser.add_argument('--model-path', type=str, default=None,
                         help='Direct path to model checkpoint (overrides --run/--latest)')
     
-    # Inference settings
-    parser.add_argument('--stochastic', action='store_true',
-                        help='Use stochastic sampling instead of greedy argmax')
-    parser.add_argument('--temperature', type=float, default=0.8,
-                        help='Sampling temperature (only with --stochastic)')
-    parser.add_argument('--top-k', type=int, default=5,
-                        help='Top-k sampling (only with --stochastic, 0=disabled)')
+    # Inference settings (None = use config from run)
+    parser.add_argument('--stochastic', action='store_true', default=None,
+                        help='Use stochastic sampling (overrides config)')
+    parser.add_argument('--deterministic', action='store_true', default=None,
+                        help='Use deterministic argmax (overrides config)')
+    parser.add_argument('--temperature', type=float, default=None,
+                        help='Sampling temperature (overrides config)')
+    parser.add_argument('--top-k', type=int, default=None,
+                        help='Top-k sampling (overrides config)')
+    # Advanced inference (None = use config from run)
+    parser.add_argument('--logit-smoothing', type=float, default=None,
+                        help='Blend logits with previous step (0.0-0.5, reduces flicker)')
+    parser.add_argument('--n-candidates', type=int, default=None,
+                        help='Sample N candidates, pick best by continuity (1=disabled, 4-8=recommended)')
+    parser.add_argument('--adaptive-temp', action='store_true', default=None,
+                        help='Enable confidence-adaptive temperature (uncertain tokens get more randomness)')
+    parser.add_argument('--no-adaptive-temp', action='store_true',
+                        help='Disable confidence-adaptive temperature')
+    parser.add_argument('--temp-boost', type=float, default=None,
+                        help='Extra temperature for uncertain tokens when adaptive (default: 0.3)')
     args = parser.parse_args()
     
     os.chdir(os.path.dirname(os.path.dirname(__file__)))
@@ -482,18 +652,49 @@ Examples:
             latest=args.latest
         )
     
+    # Determine deterministic override (only if explicitly set)
+    deterministic_override = None
+    if args.stochastic:
+        deterministic_override = False
+    elif args.deterministic:
+        deterministic_override = True
+    
+    # Determine adaptive_temp override
+    adaptive_temp_override = None
+    if args.adaptive_temp:
+        adaptive_temp_override = True
+    elif args.no_adaptive_temp:
+        adaptive_temp_override = False
+    
     print(f"\n{'='*60}")
     print(f"Model: {model_path}")
-    mode = "stochastic (temp={}, top_k={})".format(args.temperature, args.top_k) if args.stochastic else "deterministic (argmax)"
-    print(f"Inference: {mode}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
     
     player = AtariWorldPlayerHiRes(
         model_path=model_path,
-        deterministic=not args.stochastic,
+        deterministic=deterministic_override,
         temperature=args.temperature,
         top_k=args.top_k,
+        logit_smoothing=args.logit_smoothing,
+        n_candidates=args.n_candidates,
+        adaptive_temp=adaptive_temp_override,
+        temp_boost=args.temp_boost,
     )
+    
+    # Print effective inference config
+    mode = "stochastic" if not player.deterministic else "deterministic"
+    extras = []
+    if player.logit_smoothing > 0:
+        extras.append(f"smoothing={player.logit_smoothing}")
+    if player.n_candidates > 1:
+        extras.append(f"candidates={player.n_candidates}")
+    if player.adaptive_temp:
+        extras.append(f"adaptive(boost={player.temp_boost})")
+    extras_str = ", " + ", ".join(extras) if extras else ""
+    print(f"\nInference: {mode} (temp={player.temperature}, top_k={player.top_k}{extras_str})")
+    print(f"Config source: {player.config.run_dir or 'defaults'}")
+    print("=" * 60 + "\n")
+    
     player.play()
 
 
