@@ -115,6 +115,11 @@ class ReplayBuffer:
                 dones[i].item() > 0.5,
             )
     
+    def clear(self):
+        """Clear the buffer (reset position and size)."""
+        self.position = 0
+        self.size = 0
+    
     def sample(self, batch_size: int) -> TransitionBatch:
         """Sample a random batch of transitions."""
         indices = np.random.randint(0, self.size, size=batch_size)
@@ -131,6 +136,60 @@ class ReplayBuffer:
         """Sample random states (for starting imagined rollouts)."""
         indices = np.random.randint(0, self.size, size=batch_size)
         return self.states[indices].clone()
+    
+    def sample_with_recency(
+        self, 
+        batch_size: int, 
+        recent_k: int = 50000,
+        recent_frac: float = 0.5,
+    ) -> TransitionBatch:
+        """
+        Sample with mix of recent and uniform transitions.
+        
+        For WM fine-tuning: emphasizes recent on-policy data while
+        maintaining coverage of older states.
+        
+        Args:
+            batch_size: Total batch size
+            recent_k: Window size for "recent" samples
+            recent_frac: Fraction of batch from recent window (0.5 = 50%)
+            
+        Returns:
+            TransitionBatch with mixed recent/uniform samples
+        """
+        if self.size == 0:
+            raise ValueError("Empty buffer")
+        
+        recent_k = min(recent_k, self.size)
+        n_recent = int(batch_size * recent_frac)
+        n_uniform = batch_size - n_recent
+        
+        # Recent indices: sample from last recent_k transitions
+        # Handle ring buffer wraparound
+        if self.size < self.capacity:
+            # Buffer not full yet - simple indexing
+            recent_start = max(0, self.size - recent_k)
+            recent_indices = np.random.randint(recent_start, self.size, size=n_recent)
+        else:
+            # Buffer full - handle wraparound from position
+            # Recent entries are in range [position - recent_k, position)
+            offsets = np.random.randint(1, recent_k + 1, size=n_recent)
+            recent_indices = (self.position - offsets) % self.capacity
+        
+        # Uniform indices: anywhere in valid buffer
+        uniform_indices = np.random.randint(0, self.size, size=n_uniform)
+        
+        # Combine and shuffle
+        indices = np.concatenate([recent_indices, uniform_indices])
+        np.random.shuffle(indices)
+        
+        return TransitionBatch(
+            states=self.states[indices].clone(),
+            actions=self.actions[indices].clone(),
+            rewards=self.rewards[indices].clone(),
+            next_states=self.next_states[indices].clone(),
+            dones=self.dones[indices].clone(),
+        )
     
     def __len__(self) -> int:
         return self.size
@@ -243,6 +302,65 @@ class PrioritizedReplayBuffer:
         for idx, priority in zip(indices, priorities):
             self.priorities[idx] = priority
             self.max_priority = max(self.max_priority, priority)
+    
+    def sample_states(self, batch_size: int) -> torch.Tensor:
+        """Sample random states (for starting imagined rollouts)."""
+        indices = np.random.randint(0, self.size, size=batch_size)
+        return self.states[indices].clone()
+    
+    def sample_with_recency(
+        self, 
+        batch_size: int, 
+        recent_k: int = 50000,
+        recent_frac: float = 0.5,
+    ) -> TransitionBatch:
+        """
+        Sample with mix of recent and uniform transitions (ignoring priorities).
+        
+        Used for WM fine-tuning where we want recency emphasis rather than
+        TD-error priorities.
+        
+        Args:
+            batch_size: Total batch size
+            recent_k: Window size for "recent" samples
+            recent_frac: Fraction of batch from recent window (0.5 = 50%)
+            
+        Returns:
+            TransitionBatch with mixed recent/uniform samples
+        """
+        if self.size == 0:
+            raise ValueError("Empty buffer")
+        
+        recent_k = min(recent_k, self.size)
+        n_recent = int(batch_size * recent_frac)
+        n_uniform = batch_size - n_recent
+        
+        # Recent indices: sample from last recent_k transitions
+        if self.size < self.capacity:
+            recent_start = max(0, self.size - recent_k)
+            recent_indices = np.random.randint(recent_start, self.size, size=n_recent)
+        else:
+            offsets = np.random.randint(1, recent_k + 1, size=n_recent)
+            recent_indices = (self.position - offsets) % self.capacity
+        
+        # Uniform indices: anywhere in valid buffer
+        uniform_indices = np.random.randint(0, self.size, size=n_uniform)
+        
+        # Combine and shuffle
+        indices = np.concatenate([recent_indices, uniform_indices])
+        np.random.shuffle(indices)
+        
+        return TransitionBatch(
+            states=self.states[indices].clone(),
+            actions=self.actions[indices].clone(),
+            rewards=self.rewards[indices].clone(),
+            next_states=self.next_states[indices].clone(),
+            dones=self.dones[indices].clone(),
+        )
+    
+    def is_ready(self, min_size: int) -> bool:
+        """Check if buffer has enough samples for training."""
+        return self.size >= min_size
     
     def __len__(self) -> int:
         return self.size

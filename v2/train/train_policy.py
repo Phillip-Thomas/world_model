@@ -34,7 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from models.vqvae_hires import VQVAEHiRes
 from models.temporal_world_model import TemporalVisualWorldModel
 from agents.dqn_agent import DQNAgent, DQNConfig
-from agents.replay_buffer import DualReplayBuffer
+from agents.replay_buffer import DualReplayBuffer, PrioritizedReplayBuffer, ReplayBuffer
 
 try:
     import gymnasium as gym
@@ -53,35 +53,63 @@ class DynaConfig:
     game: str = "ALE/MsPacman-v5"
     frame_skip: int = 4
     max_episode_steps: int = 10000
-    n_envs: int = 8                   # Parallel environments for more GPU usage
+    n_envs: int = 2                   # Reduced to 2 - CPU bottleneck from Atari emulation
     
     # Training - epoch based
-    n_epochs: int = 20                # Number of training epochs
-    steps_per_epoch: int = 10000      # Environment steps per epoch (per env)
+    n_epochs: int = 50                # Increased for longer training
+    steps_per_epoch: int = 5000       # Increased for more steps per epoch
     train_freq: int = 4               # Train every N environment steps
-    batch_size: int = 1024            # Large batch for GPU utilization
-    gradient_steps: int = 2           # Gradient updates per train step
-    warmup_steps: int = 2000          # Fewer warmup steps (n_envs fill faster)
+    batch_size: int = 256             # Reduced to lower CPU pressure
+    gradient_steps: int = 2           # Reduced from 4 to 2 - less GPU work per step
+    warmup_steps: int = 5000          # Increased warmup for more initial data
+    grad_clip: float = 10.0           # Gradient clipping for DQN stability
     
-    # Dyna-specific
-    imagined_rollout_len: int = 3     # K steps of imagination
-    imagined_ratio: float = 0.0       # Fraction of imagined data (0 = real only)
-    imagined_update_freq: int = 500   # Generate imagined data every N steps
-    imagined_batch_size: int = 64     # States to start rollouts from
+    # Dyna-specific (WM → Policy)
+    imagined_rollout_len: int = 3     # K steps of imagination (start short)
+    imagined_ratio: float = 0.05      # Fraction of imagined data (5% to start)
+    imagined_update_freq: int = 100   # Less frequent imagination to reduce load
+    imagined_batch_size: int = 32     # Reduced to lower CPU/GPU pressure
+    imagined_buffer_ttl: int = 0      # 0 = disabled, use ring buffer (no hard clears)
     
-    # Buffers
-    real_buffer_size: int = 200000    # Larger buffer
-    imagined_buffer_size: int = 100000
+    # Adaptive imagination (based on WM quality)
+    adaptive_imagined_ratio: bool = True  # Enable adaptive ratio based on WM loss
+    imagined_ratio_thresholds: tuple = (  # (wm_loss_threshold, imagined_ratio)
+        (0.8, 0.02),   # WM loss < 0.8 → 2% imagined
+        (0.6, 0.05),   # WM loss < 0.6 → 5% imagined
+        (0.5, 0.10),   # WM loss < 0.5 → 10% imagined
+        (0.4, 0.15),   # WM loss < 0.4 → 15% imagined
+    )
+    
+    # Bidirectional: WM fine-tuning (Policy → WM)
+    wm_finetune: bool = True          # Enable WM fine-tuning for proper Dyna loop
+    wm_update_freq: int = 100         # Less frequent WM updates to reduce load
+    wm_updates_per_step: int = 1      # Number of WM gradient steps each time
+    wm_batch_size: int = 16           # Small batch
+    wm_lr: float = 1e-5               # Lower LR than initial WM training
+    wm_grad_clip: float = 1.0         # Gradient clipping for WM
+    wm_recent_k: int = 50000          # Recency window for WM sampling
+    wm_recent_frac: float = 0.5       # 50% recent, 50% uniform
+    
+    # Prioritized replay
+    use_prioritized: bool = True      # Use prioritized experience replay
+    priority_alpha: float = 0.6       # Priority exponent
+    priority_beta_start: float = 0.4  # IS correction, anneals to 1.0
+    priority_beta_increment: float = 0.001  # Beta annealing rate
+    
+    # Buffers - reduced to save CPU RAM
+    real_buffer_size: int = 100000    # Reduced from 200k
+    imagined_buffer_size: int = 50000 # Reduced from 100k
     
     # Evaluation
-    eval_episodes: int = 5            # Episodes per evaluation
+    eval_episodes: int = 20           # Increased for stable eval estimates
+    eval_random_noops: int = 30       # Random no-ops at eval reset for stochasticity
     
     # DQN hyperparameters
-    learning_rate: float = 3e-4       # Higher LR for faster learning
+    learning_rate: float = 1e-4       # Reduced from 3e-4 for stability at longer training
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay_epochs: int = 10    # Decay over N epochs
+    epsilon_decay_epochs: int = 20    # Slower decay over more epochs
     target_update_freq: int = 1000    # Steps between target network updates
 
 
@@ -94,6 +122,8 @@ class TrainingStats:
     # Training metrics
     train_loss: List[float] = field(default_factory=list)
     avg_q_value: List[float] = field(default_factory=list)
+    max_q_value: List[float] = field(default_factory=list)
+    avg_td_error: List[float] = field(default_factory=list)
     
     # Episode metrics  
     episode_reward: List[float] = field(default_factory=list)
@@ -109,6 +139,12 @@ class TrainingStats:
     # Buffer stats
     buffer_real_size: List[int] = field(default_factory=list)
     buffer_imagined_size: List[int] = field(default_factory=list)
+    
+    # Dyna instrumentation
+    n_real_updates: List[int] = field(default_factory=list)
+    n_imagined_updates: List[int] = field(default_factory=list)
+    actual_imagined_ratio: List[float] = field(default_factory=list)
+    wm_loss: List[float] = field(default_factory=list)
 
 
 class AtariEnvWrapper:
@@ -123,11 +159,13 @@ class AtariEnvWrapper:
         history_len: int = 4,
         target_size: Tuple[int, int] = (84, 64),
         max_episode_steps: int = 10000,
+        random_noops: int = 0,  # Max random no-ops at reset for eval stochasticity
     ):
         self.vqvae = vqvae
         self.device = device
         self.history_len = history_len
         self.target_size = target_size
+        self.random_noops = random_noops
         
         # Get token dimensions from VQ-VAE
         with torch.no_grad():
@@ -154,6 +192,14 @@ class AtariEnvWrapper:
     def reset(self) -> torch.Tensor:
         """Reset environment and return initial token history."""
         obs, info = self.env.reset()
+        
+        # Random no-op starts for evaluation stochasticity
+        if self.random_noops > 0:
+            n_noops = np.random.randint(0, self.random_noops + 1)
+            for _ in range(n_noops):
+                obs, _, terminated, truncated, _ = self.env.step(0)  # NOOP action
+                if terminated or truncated:
+                    obs, info = self.env.reset()
         
         # Preprocess and encode
         frame = self._preprocess(obs)
@@ -285,7 +331,7 @@ class VectorizedAtariEnv:
         self.episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
         self.completed_episodes = []
         
-        return self.token_histories.clone()  # (n_envs, history_len, n_tokens)
+        return self.token_histories.clone().cpu()  # (n_envs, history_len, n_tokens) on CPU for replay
     
     def step(self, actions: np.ndarray) -> Tuple[torch.Tensor, np.ndarray, np.ndarray, List[dict]]:
         """
@@ -346,7 +392,7 @@ class VectorizedAtariEnv:
             if dones[i]:
                 self.token_histories[i] = tokens[i:i+1].repeat(self.history_len, 1)
         
-        return self.token_histories.clone(), rewards, dones, infos
+        return self.token_histories.clone().cpu(), rewards, dones, infos  # CPU for replay storage
     
     def get_completed_episodes(self) -> List[dict]:
         """Get and clear completed episodes."""
@@ -411,11 +457,10 @@ class ImaginedRolloutGenerator:
                 if not active.any():
                     break
                 
-                # Select actions using policy
-                actions = torch.zeros(B, dtype=torch.long, device=self.device)
-                for i in range(B):
-                    if active[i]:
-                        actions[i] = self.policy.select_action(current_states[i])
+                # Select actions using policy (BATCHED - single forward pass!)
+                # Only compute for active states, but we batch them together
+                actions_np = self.policy.select_actions_batch(current_states)
+                actions = torch.from_numpy(actions_np).long().to(self.device)
                 
                 # World model step
                 next_tokens, reward_pred, done_pred = self.world_model.forward_with_heads(
@@ -428,6 +473,10 @@ class ImaginedRolloutGenerator:
                 next_states = torch.roll(current_states, shifts=-1, dims=1)
                 next_states[:, -1, :] = next_tokens
                 
+                # Check termination (before storing, so we can use binary flags)
+                terminated = done_pred > done_threshold
+                done_flags = terminated.float()  # Binary 0/1 for DQN (not soft probabilities)
+                
                 # Store transitions (only for active states)
                 for i in range(B):
                     if active[i]:
@@ -435,10 +484,7 @@ class ImaginedRolloutGenerator:
                         all_actions.append(actions[i])
                         all_rewards.append(reward_pred[i])
                         all_next_states.append(next_states[i])
-                        all_dones.append(done_pred[i])
-                
-                # Check termination
-                terminated = done_pred > done_threshold
+                        all_dones.append(done_flags[i])  # Binary done flag, not probability
                 active = active & ~terminated
                 
                 # Update for next step
@@ -461,6 +507,68 @@ class ImaginedRolloutGenerator:
                 torch.stack(all_next_states),
                 torch.stack(all_dones),
             )
+
+
+def wm_update_step(
+    world_model: TemporalVisualWorldModel,
+    wm_optimizer: torch.optim.Optimizer,
+    buffer: PrioritizedReplayBuffer,
+    config: DynaConfig,
+    device: str,
+) -> float:
+    """
+    Single world model fine-tuning step on REAL transitions only.
+    
+    Uses recency-weighted sampling to emphasize recent on-policy data
+    while maintaining coverage of older states.
+    
+    Args:
+        world_model: The world model to fine-tune
+        wm_optimizer: Optimizer for world model
+        buffer: Replay buffer with real transitions
+        config: Training configuration
+        device: Device to use
+        
+    Returns:
+        wm_loss: The world model loss value
+    """
+    world_model.train()
+    
+    # Sample with recency mix (50% recent, 50% uniform)
+    batch = buffer.sample_with_recency(
+        batch_size=config.wm_batch_size,
+        recent_k=config.wm_recent_k,
+        recent_frac=config.wm_recent_frac,
+    )
+    batch = batch.to(device)
+    
+    # Extract inputs for WM training
+    # states: (B, T, N) - full history
+    # next_states: (B, T, N) - we want the last frame as target
+    frame_history = batch.states  # (B, T=4, N=336)
+    actions = batch.actions       # (B,)
+    target_tokens = batch.next_states[:, -1, :]  # (B, N) - newest frame only
+    target_rewards = batch.rewards  # (B,)
+    target_dones = batch.dones      # (B,)
+    
+    # Forward pass with loss computation
+    _, wm_loss, aux = world_model.forward(
+        frame_history,
+        actions,
+        target_tokens,
+        target_rewards,
+        target_dones,
+    )
+    
+    # Backward pass
+    wm_optimizer.zero_grad(set_to_none=True)
+    wm_loss.backward()
+    torch.nn.utils.clip_grad_norm_(world_model.parameters(), config.wm_grad_clip)
+    wm_optimizer.step()
+    
+    world_model.eval()
+    
+    return wm_loss.item()
 
 
 def plot_training_progress(stats: TrainingStats, save_path: str):
@@ -607,6 +715,9 @@ def train_dyna(
     base_dir: str = "checkpoints/v2/mspacman",
     config: Optional[DynaConfig] = None,
     device: str = None,
+    resume_policy: str = None,
+    resume_wm: str = None,
+    epsilon_override: float = None,
 ):
     """Main Dyna-style training loop with epochs."""
     config = config or DynaConfig()
@@ -621,6 +732,10 @@ def train_dyna(
     print(f"Steps/epoch: {config.steps_per_epoch}")
     print(f"Batch size: {config.batch_size}")
     print(f"Gradient steps: {config.gradient_steps}")
+    if resume_policy:
+        print(f"Resuming policy from: {resume_policy}")
+    if resume_wm:
+        print(f"Resuming WM from: {resume_wm}")
     
     # Create run directory
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -661,8 +776,16 @@ def train_dyna(
         max_history=4,
     ).to(device)
     world_model.load_state_dict(wm_ckpt['model_state_dict'])
+    print(f"  Loaded base WM from {wm_path}")
+    
+    # Optionally load fine-tuned WM checkpoint
+    if resume_wm:
+        print(f"  Loading fine-tuned WM from {resume_wm}...")
+        wm_finetune_state = torch.load(resume_wm, map_location=device, weights_only=True)
+        world_model.load_state_dict(wm_finetune_state)
+        print(f"  Loaded fine-tuned WM!")
+    
     world_model.eval()
-    print(f"  Loaded from {wm_path}")
     
     n_actions = wm_ckpt['n_actions']
     n_tokens = wm_ckpt['token_h'] * wm_ckpt['token_w']
@@ -682,7 +805,7 @@ def train_dyna(
     print(f"  Actions: {n_actions}")
     print(f"  Token grid: {vec_env.token_h}x{vec_env.token_w} = {n_tokens}")
     
-    # Single env for evaluation
+    # Single env for evaluation (with random no-ops for stochasticity)
     eval_env = AtariEnvWrapper(
         game=config.game,
         vqvae=vqvae,
@@ -690,6 +813,7 @@ def train_dyna(
         frame_skip=config.frame_skip,
         history_len=4,
         max_episode_steps=config.max_episode_steps,
+        random_noops=config.eval_random_noops,
     )
     
     # Calculate epsilon decay
@@ -720,19 +844,59 @@ def train_dyna(
     )
     print(f"  Policy parameters: {sum(p.numel() for p in agent.policy_net.parameters()):,}")
     
-    # Create buffers
-    buffer = DualReplayBuffer(
-        real_capacity=config.real_buffer_size,
-        imagined_capacity=config.imagined_buffer_size,
+    # Optionally load policy checkpoint to resume training
+    if resume_policy:
+        print(f"  Loading policy from {resume_policy}...")
+        agent.load(resume_policy)
+        print(f"  Resumed! Epsilon: {agent.epsilon:.3f}, Steps: {agent.train_steps:,}")
+    
+    # Override epsilon if specified (for more exploration with new WM)
+    if epsilon_override is not None:
+        old_eps = agent.epsilon
+        agent.epsilon = epsilon_override
+        print(f"  Epsilon overridden: {old_eps:.3f} → {epsilon_override:.3f}")
+    
+    # Create buffers - use PrioritizedReplayBuffer for bidirectional training
+    if config.use_prioritized:
+        real_buffer = PrioritizedReplayBuffer(
+            capacity=config.real_buffer_size,
+            history_len=4,
+            n_tokens=n_tokens,
+            alpha=config.priority_alpha,
+            beta=config.priority_beta_start,
+            beta_increment=config.priority_beta_increment,
+        )
+        print(f"  Using PrioritizedReplayBuffer (alpha={config.priority_alpha})")
+    else:
+        real_buffer = ReplayBuffer(
+            capacity=config.real_buffer_size,
+            history_len=4,
+            n_tokens=n_tokens,
+        )
+        print(f"  Using standard ReplayBuffer")
+    
+    # Separate buffer for imagined transitions (simpler, no priorities needed)
+    imagined_buffer = ReplayBuffer(
+        capacity=config.imagined_buffer_size,
         history_len=4,
         n_tokens=n_tokens,
-        real_ratio=1.0 - config.imagined_ratio,
     )
     
     # Create imagined rollout generator (if using imagination)
     imagination = None
     if config.imagined_ratio > 0:
         imagination = ImaginedRolloutGenerator(world_model, agent, device)
+        print(f"  Imagination enabled: ratio={config.imagined_ratio}, rollout_len={config.imagined_rollout_len}")
+    
+    # Create WM optimizer for online fine-tuning (bidirectional: Policy → WM)
+    wm_optimizer = None
+    if config.wm_finetune:
+        wm_optimizer = torch.optim.AdamW(
+            world_model.parameters(),
+            lr=config.wm_lr,
+            weight_decay=0.0,
+        )
+        print(f"  WM fine-tuning enabled: lr={config.wm_lr}, update_freq={config.wm_update_freq}")
     
     # Training state
     stats = TrainingStats()
@@ -743,6 +907,9 @@ def train_dyna(
     q_values = []
     best_eval_reward = float('-inf')
     global_step = 0
+    
+    # Track WM losses for bidirectional training
+    wm_losses = []
     
     print("\n" + "=" * 60)
     print("Starting training...")
@@ -756,9 +923,9 @@ def train_dyna(
         actions = np.random.randint(0, n_actions, size=config.n_envs)
         next_states, rewards, dones, infos = vec_env.step(actions)
         
-        # Store transitions for each env
+        # Store transitions for each env in REAL buffer
         for i in range(config.n_envs):
-            buffer.add_real(states[i], actions[i], rewards[i], next_states[i], dones[i])
+            real_buffer.add(states[i], actions[i], rewards[i], next_states[i], dones[i])
         
         states = next_states
         
@@ -768,15 +935,26 @@ def train_dyna(
             episode_rewards.append(ep['reward'])
             episode_lengths.append(ep['length'])
     
-    print(f"  Warmup complete. Buffer size: {buffer.real_size}")
+    print(f"  Warmup complete. Buffer size: {len(real_buffer)}")
     print(f"  Episodes: {len(episode_rewards)}, Avg reward: {np.mean(episode_rewards) if episode_rewards else 0:.1f}")
+    
+    # Initialize adaptive imagined ratio
+    current_imagined_ratio = 0.0 if config.adaptive_imagined_ratio else config.imagined_ratio
+    if config.adaptive_imagined_ratio:
+        print(f"\n  Adaptive imagination enabled: ratio starts at 0%, scales with WM quality")
     
     # Epoch-based training
     for epoch in range(1, config.n_epochs + 1):
         epoch_start = time.time()
         epoch_losses = []
         epoch_q_values = []
+        epoch_max_q_values = []
+        epoch_td_errors = []
         epoch_rewards = []
+        
+        # Dyna instrumentation counters
+        epoch_real_updates = 0
+        epoch_imagined_updates = 0
         
         print(f"\n{'='*60}")
         print(f"Epoch {epoch}/{config.n_epochs}")
@@ -784,20 +962,22 @@ def train_dyna(
         
         pbar = tqdm(range(config.steps_per_epoch), desc=f"Epoch {epoch}")
         
+        epoch_wm_losses = []
+        
         for step in pbar:
             global_step += 1
             
-            # Select actions for all envs (batch)
-            actions = np.zeros(config.n_envs, dtype=np.int64)
-            for i in range(config.n_envs):
-                actions[i] = agent.select_action(states[i])
+            # ===== 1. COLLECT REAL EXPERIENCE =====
+            # Select actions for all envs (BATCHED - single forward pass!)
+            # states is already (n_envs, T, N) tensor from vec_env
+            actions = agent.select_actions_batch(states)
             
             # Environment step (all envs)
             next_states, rewards, dones, infos = vec_env.step(actions)
             
-            # Store transitions for each env
+            # Store transitions for each env in REAL buffer
             for i in range(config.n_envs):
-                buffer.add_real(states[i], actions[i], rewards[i], next_states[i], dones[i])
+                real_buffer.add(states[i], actions[i], rewards[i], next_states[i], dones[i])
             
             states = next_states
             
@@ -808,11 +988,23 @@ def train_dyna(
                 episode_lengths.append(ep['length'])
                 epoch_rewards.append(ep['reward'])
             
-            # Generate imagined experience (if enabled)
+            # ===== 2. WORLD MODEL FINE-TUNING (Policy → WM) =====
+            if (wm_optimizer is not None and 
+                global_step % config.wm_update_freq == 0 and 
+                real_buffer.is_ready(config.wm_batch_size)):
+                for _ in range(config.wm_updates_per_step):
+                    wm_loss = wm_update_step(
+                        world_model, wm_optimizer, real_buffer, config, device
+                    )
+                    wm_losses.append(wm_loss)
+                    epoch_wm_losses.append(wm_loss)
+            
+            # ===== 3. GENERATE IMAGINED EXPERIENCE (WM → Policy) =====
+            # Offset by 50 to stagger with WM updates (avoids double-pause at step 100, 200, etc.)
             if (imagination is not None and 
-                step % config.imagined_update_freq == 0 and 
-                buffer.real_size >= config.imagined_batch_size):
-                start_states = buffer.sample_real_states(config.imagined_batch_size)
+                (global_step + 50) % config.imagined_update_freq == 0 and
+                len(real_buffer) >= config.imagined_batch_size):
+                start_states = real_buffer.sample_states(config.imagined_batch_size)
                 start_states = start_states.to(device)
                 
                 im_states, im_actions, im_rewards, im_next, im_dones = imagination.generate(
@@ -821,30 +1013,64 @@ def train_dyna(
                 )
                 
                 if len(im_states) > 0:
-                    buffer.add_imagined_batch(im_states, im_actions, im_rewards, im_next, im_dones)
+                    imagined_buffer.add_batch(im_states, im_actions, im_rewards, im_next, im_dones)
             
-            # Train policy (multiple gradient steps)
-            if step % config.train_freq == 0 and buffer.is_ready(config.batch_size):
-                for _ in range(config.gradient_steps):
-                    batch = buffer.sample_mixed(config.batch_size)
-                    loss = agent.train_step(batch)
-                    epoch_losses.append(loss)
+            # ===== 4. TTL: CLEAR STALE IMAGINED DATA =====
+            # TTL=0 means disabled (ring buffer overwrites naturally)
+            if config.imagined_buffer_ttl > 0 and global_step % config.imagined_buffer_ttl == 0 and len(imagined_buffer) > 0:
+                imagined_buffer.clear()
+            
+            # ===== 5. TRAIN POLICY (Prioritized + Mixed) =====
+            if step % config.train_freq == 0 and real_buffer.is_ready(config.batch_size):
+                for grad_step in range(config.gradient_steps):
+                    # Decide: train on real (prioritized) or imagined (uniform)
+                    # Use adaptive ratio if enabled, otherwise static config ratio
+                    effective_ratio = current_imagined_ratio if config.adaptive_imagined_ratio else config.imagined_ratio
+                    use_imagined = (
+                        effective_ratio > 0 and
+                        len(imagined_buffer) >= config.batch_size and
+                        np.random.random() < effective_ratio
+                    )
+                    
+                    if use_imagined:
+                        # Train on imagined data (uniform sampling, no priorities)
+                        batch = imagined_buffer.sample(config.batch_size)
+                        loss = agent.train_step(batch)
+                        epoch_losses.append(loss)
+                        epoch_imagined_updates += 1
+                    else:
+                        # Train on real data with prioritized sampling
+                        if config.use_prioritized:
+                            batch, weights, indices = real_buffer.sample(config.batch_size)
+                            loss, td_errors = agent.train_step_prioritized(batch, weights)
+                            # Update priorities with |TD-error| + epsilon
+                            real_buffer.update_priorities(indices, td_errors)
+                            epoch_losses.append(loss)
+                            epoch_td_errors.append(td_errors.abs().mean().item())
+                        else:
+                            batch = real_buffer.sample(config.batch_size)
+                            loss = agent.train_step(batch)
+                            epoch_losses.append(loss)
+                        epoch_real_updates += 1
                     
                     # Track Q-values occasionally
                     if len(epoch_losses) % 100 == 0:
                         with torch.no_grad():
                             q = agent.policy_net(batch.states.to(device))
                             epoch_q_values.append(q.mean().item())
+                            epoch_max_q_values.append(q.max().item())
             
             # Update progress bar
             if step % 100 == 0:
                 avg_reward = np.mean(epoch_rewards[-10:]) if epoch_rewards else 0
                 avg_loss = np.mean(epoch_losses[-100:]) if epoch_losses else 0
+                avg_wm_loss = np.mean(epoch_wm_losses[-50:]) if epoch_wm_losses else 0
                 pbar.set_postfix({
                     'reward': f'{avg_reward:.1f}',
                     'loss': f'{avg_loss:.4f}',
+                    'wm': f'{avg_wm_loss:.4f}',
                     'eps': f'{agent.epsilon:.3f}',
-                    'buf': f'{buffer.real_size//1000}k',
+                    'buf': f'{len(real_buffer)//1000}k+{len(imagined_buffer)//1000}k',
                 })
         
         # End of epoch - evaluate
@@ -856,23 +1082,49 @@ def train_dyna(
         stats.step.append(global_step)
         stats.train_loss.append(np.mean(epoch_losses) if epoch_losses else 0)
         stats.avg_q_value.append(np.mean(epoch_q_values) if epoch_q_values else 0)
+        stats.max_q_value.append(np.mean(epoch_max_q_values) if epoch_max_q_values else 0)
+        stats.avg_td_error.append(np.mean(epoch_td_errors) if epoch_td_errors else 0)
         stats.episode_reward.append(np.mean(epoch_rewards) if epoch_rewards else 0)
         stats.episode_length.append(np.mean(episode_lengths[-len(epoch_rewards):]) if epoch_rewards else 0)
         stats.eval_reward_mean.append(eval_mean)
         stats.eval_reward_std.append(eval_std)
         stats.epsilon.append(agent.epsilon)
-        stats.buffer_real_size.append(buffer.real_size)
-        stats.buffer_imagined_size.append(buffer.imagined_size)
+        stats.buffer_real_size.append(len(real_buffer))
+        stats.buffer_imagined_size.append(len(imagined_buffer))
+        
+        # Dyna instrumentation
+        stats.n_real_updates.append(epoch_real_updates)
+        stats.n_imagined_updates.append(epoch_imagined_updates)
+        total_updates = epoch_real_updates + epoch_imagined_updates
+        actual_ratio = epoch_imagined_updates / total_updates if total_updates > 0 else 0
+        stats.actual_imagined_ratio.append(actual_ratio)
+        stats.wm_loss.append(np.mean(epoch_wm_losses) if epoch_wm_losses else 0)
         
         epoch_time = time.time() - epoch_start
+        avg_wm_loss = np.mean(epoch_wm_losses) if epoch_wm_losses else 0
+        
+        # Update adaptive imagined ratio based on WM loss
+        if config.adaptive_imagined_ratio and avg_wm_loss > 0:
+            old_ratio = current_imagined_ratio
+            current_imagined_ratio = 0.0  # Default: no imagination if WM is poor
+            for threshold, ratio in config.imagined_ratio_thresholds:
+                if avg_wm_loss < threshold:
+                    current_imagined_ratio = ratio
+            if current_imagined_ratio != old_ratio:
+                print(f"    Adaptive ratio: {old_ratio*100:.1f}% → {current_imagined_ratio*100:.1f}% (WM loss={avg_wm_loss:.4f})")
         
         # Print epoch summary
         print(f"\n  Epoch {epoch} Summary:")
         print(f"    Train reward (avg): {stats.episode_reward[-1]:.1f}")
         print(f"    Eval reward: {eval_mean:.1f} +/- {eval_std:.1f}")
-        print(f"    Loss: {stats.train_loss[-1]:.4f}")
+        print(f"    Policy Loss: {stats.train_loss[-1]:.4f} | Avg TD: {stats.avg_td_error[-1]:.4f}")
+        print(f"    Q-values: mean={stats.avg_q_value[-1]:.2f}, max={stats.max_q_value[-1]:.2f}")
+        if config.wm_finetune:
+            print(f"    WM Loss: {avg_wm_loss:.4f}")
+        target_ratio = current_imagined_ratio if config.adaptive_imagined_ratio else config.imagined_ratio
+        print(f"    Updates: {epoch_real_updates} real, {epoch_imagined_updates} imag ({actual_ratio*100:.1f}% actual, {target_ratio*100:.1f}% target)")
         print(f"    Epsilon: {agent.epsilon:.3f}")
-        print(f"    Buffer: {buffer.real_size:,} real, {buffer.imagined_size:,} imagined")
+        print(f"    Buffer: {len(real_buffer):,} real, {len(imagined_buffer):,} imagined")
         print(f"    Time: {epoch_time:.1f}s")
         
         # Save checkpoint
@@ -884,12 +1136,26 @@ def train_dyna(
         
         agent.save(f"{run_dir}/policy_epoch{epoch}.pt")
         
+        # Save World Model if fine-tuning is enabled
+        if config.wm_finetune:
+            torch.save(world_model.state_dict(), f"{run_dir}/world_model_epoch{epoch}.pt")
+            # Track best WM loss
+            if not hasattr(train_dyna, 'best_wm_loss'):
+                train_dyna.best_wm_loss = float('inf')
+            avg_wm_loss = np.mean(wm_losses[-100:]) if wm_losses else float('inf')
+            if avg_wm_loss < train_dyna.best_wm_loss:
+                train_dyna.best_wm_loss = avg_wm_loss
+                torch.save(world_model.state_dict(), f"{run_dir}/world_model_finetuned_best.pt")
+                print(f"    New best WM! Loss: {avg_wm_loss:.4f}")
+        
         # Update plots and stats
         plot_training_progress(stats, f"{run_dir}/training_progress.png")
         save_training_stats(stats, f"{run_dir}/training_stats.txt")
     
     # Final save
     agent.save(f"{run_dir}/policy_final.pt")
+    if config.wm_finetune:
+        torch.save(world_model.state_dict(), f"{run_dir}/world_model_final.pt")
     vec_env.close()
     eval_env.close()
     
@@ -909,14 +1175,20 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Dyna-style policy training")
     parser.add_argument("--base_dir", type=str, default="checkpoints/v2/mspacman",
                         help="Directory with VQ-VAE and world model")
-    parser.add_argument("--epochs", type=int, default=20,
+    parser.add_argument("--epochs", type=int, default=50,
                         help="Number of training epochs")
-    parser.add_argument("--steps_per_epoch", type=int, default=10000,
+    parser.add_argument("--steps_per_epoch", type=int, default=5000,
                         help="Environment steps per epoch")
     parser.add_argument("--batch_size", type=int, default=256,
                         help="Batch size for training")
     parser.add_argument("--device", type=str, default=None,
                         help="Device (cuda/cpu)")
+    parser.add_argument("--resume_policy", type=str, default=None,
+                        help="Path to policy checkpoint to resume from")
+    parser.add_argument("--resume_wm", type=str, default=None,
+                        help="Path to fine-tuned WM checkpoint (optional)")
+    parser.add_argument("--epsilon", type=float, default=None,
+                        help="Override epsilon value (e.g., 0.5 for more exploration)")
     
     args = parser.parse_args()
     
@@ -925,4 +1197,11 @@ if __name__ == "__main__":
         steps_per_epoch=args.steps_per_epoch,
         batch_size=args.batch_size,
     )
-    train_dyna(base_dir=args.base_dir, config=config, device=args.device)
+    train_dyna(
+        base_dir=args.base_dir, 
+        config=config, 
+        device=args.device,
+        resume_policy=args.resume_policy,
+        resume_wm=args.resume_wm,
+        epsilon_override=args.epsilon,
+    )

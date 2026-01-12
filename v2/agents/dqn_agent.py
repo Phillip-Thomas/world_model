@@ -336,6 +336,37 @@ class DQNAgent:
         self.policy_net.train()
         return action
     
+    def select_actions_batch(self, states: torch.Tensor) -> np.ndarray:
+        """
+        Select actions for a batch of states using epsilon-greedy.
+        
+        This is much more GPU-efficient than calling select_action in a loop!
+        
+        Args:
+            states: (B, T, N) batch of token histories
+            
+        Returns:
+            actions: (B,) numpy array of action indices
+        """
+        self.policy_net.eval()
+        B = states.shape[0]
+        states = states.to(self.device)
+        
+        with torch.no_grad():
+            # Single batched forward pass for all states
+            q_values = self.policy_net(states)  # (B, n_actions)
+            greedy_actions = q_values.argmax(dim=1).cpu().numpy()
+        
+        # Apply epsilon-greedy exploration per action
+        random_mask = np.random.random(B) < self.epsilon
+        random_actions = np.random.randint(0, self.n_actions, size=B)
+        
+        # Use greedy where mask is False, random where mask is True
+        actions = np.where(random_mask, random_actions, greedy_actions)
+        
+        self.policy_net.train()
+        return actions
+    
     def train_step(self, batch: TransitionBatch) -> float:
         """
         Train on a batch of transitions.

@@ -253,8 +253,8 @@ class TemporalVisualWorldModel(nn.Module):
         # Token loss
         if target_tokens is not None:
             token_loss = F.cross_entropy(
-                logits.view(-1, self.n_vocab),
-                target_tokens.view(-1),
+                logits.reshape(-1, self.n_vocab),  # Use reshape for non-contiguous tensors
+                target_tokens.reshape(-1),          # From replay buffer sampling
             )
             loss = token_loss
             aux['token_loss'] = token_loss.detach()
