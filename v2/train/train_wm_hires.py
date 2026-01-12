@@ -354,8 +354,18 @@ def train_world_model_hires(
     input_w = vqvae_ckpt.get('input_w', 64)
     n_embeddings = vqvae_ckpt.get('n_embeddings', 32)  # Match checkpoint
     
+    # Infer hidden_channels from layer shapes if not saved
+    hidden_channels = vqvae_ckpt.get('hidden_channels', None)
+    if hidden_channels is None:
+        # Infer from encoder.initial.weight shape: (hidden_channels, in_channels, 3, 3)
+        initial_weight = vqvae_ckpt['model_state_dict'].get('encoder.initial.weight')
+        if initial_weight is not None:
+            hidden_channels = initial_weight.shape[0]
+        else:
+            hidden_channels = 64  # fallback default
+    
     vqvae = VQVAEHiRes(
-        in_channels=3, hidden_channels=64, latent_channels=256,
+        in_channels=3, hidden_channels=hidden_channels, latent_channels=256,
         n_embeddings=n_embeddings, n_residual=2,
         input_size=(input_h, input_w),
     ).to(device)
@@ -363,7 +373,7 @@ def train_world_model_hires(
     
     # CRITICAL: Freeze VQ-VAE to prevent codebook drift during world model training!
     vqvae.freeze_for_world_model()
-    print(f"  Input: {input_h}x{input_w}")
+    print(f"  Input: {input_h}x{input_w}, hidden={hidden_channels}, codes={n_embeddings}")
     
     # === Load Data (with optional human gameplay merge) ===
     print("\nLoading game data...")

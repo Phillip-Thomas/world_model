@@ -49,14 +49,57 @@ from PIL import Image
 
 
 # =============================================================================
+# Game Configuration
+# =============================================================================
+
+GAME_CONFIGS = {
+    "breakout": {
+        "env_name": "ALE/Breakout-v5",
+        "base_dir": "checkpoints/v2/atari",
+        "key_to_action": {
+            ' ': 1,      # Space = Fire
+            'right': 2,  # Right arrow
+            'left': 3,   # Left arrow
+        },
+        "action_help": "SPACE=Fire  ←→=Move",
+    },
+    "mspacman": {
+        "env_name": "ALE/MsPacman-v5",
+        "base_dir": "checkpoints/v2/mspacman",
+        "key_to_action": {
+            'up': 1,     # Up arrow
+            'right': 2,  # Right arrow  
+            'left': 3,   # Left arrow
+            'down': 4,   # Down arrow
+        },
+        "action_help": "↑↓←→=Move",
+    },
+}
+
+DEFAULT_GAME = "breakout"
+
+
+def get_game_config(game: str) -> dict:
+    """Get configuration for a specific game."""
+    game = game.lower()
+    if game not in GAME_CONFIGS:
+        available = ", ".join(GAME_CONFIGS.keys())
+        raise ValueError(f"Unknown game '{game}'. Available: {available}")
+    return GAME_CONFIGS[game]
+
+
+# =============================================================================
 # Checkpoint Discovery Helpers
 # =============================================================================
 
-RUNS_DIR = "checkpoints/v2/atari/runs"
+def get_runs_dir(base_dir: str) -> str:
+    """Get the wm_runs directory for a game's base directory."""
+    return os.path.join(base_dir, "wm_runs")
 
-def get_latest_run() -> str:
+
+def get_latest_run(base_dir: str) -> str:
     """Find the most recent run directory (by name, which is timestamp-based)."""
-    runs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), RUNS_DIR)
+    runs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), get_runs_dir(base_dir))
     if not os.path.exists(runs_path):
         raise FileNotFoundError(f"Runs directory not found: {runs_path}")
     
@@ -69,14 +112,14 @@ def get_latest_run() -> str:
     return run_dirs[0]
 
 
-def get_latest_checkpoint(run_dir: str) -> str:
+def get_latest_checkpoint(run_dir: str, base_dir: str) -> str:
     """Find the highest-epoch checkpoint in a run directory."""
-    runs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), RUNS_DIR, run_dir)
+    runs_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), get_runs_dir(base_dir), run_dir)
     if not os.path.exists(runs_path):
         raise FileNotFoundError(f"Run directory not found: {runs_path}")
     
-    # Find all checkpoint files
-    checkpoints = glob.glob(os.path.join(runs_path, "atari_world_model_hires*.pt"))
+    # Find all checkpoint files (game-agnostic pattern)
+    checkpoints = glob.glob(os.path.join(runs_path, "*world_model*.pt"))
     if not checkpoints:
         raise FileNotFoundError(f"No checkpoints found in: {runs_path}")
     
@@ -86,15 +129,19 @@ def get_latest_checkpoint(run_dir: str) -> str:
     
     for ckpt in checkpoints:
         basename = os.path.basename(ckpt)
-        # Match patterns like "atari_world_model_hires_epoch20.pt"
+        # Match patterns like "*_epoch20.pt" or "*_best.pt"
         match = re.search(r'epoch(\d+)\.pt$', basename)
         if match:
             epoch = int(match.group(1))
             if epoch > best_epoch:
                 best_epoch = epoch
                 best_ckpt = ckpt
-        elif basename == "atari_world_model_hires.pt" and best_epoch < 0:
-            # Fallback to base checkpoint if no epoch checkpoints
+        elif "_best.pt" in basename and best_epoch < 0:
+            # Use best checkpoint as fallback
+            best_ckpt = ckpt
+            best_epoch = 0
+        elif basename.endswith("world_model_hires.pt") and best_epoch < 0:
+            # Fallback to base checkpoint
             best_ckpt = ckpt
             best_epoch = 0
     
@@ -104,30 +151,33 @@ def get_latest_checkpoint(run_dir: str) -> str:
     return best_ckpt
 
 
-def resolve_model_path(run: str = None, checkpoint: str = None, latest: bool = False) -> str:
+def resolve_model_path(run: str = None, checkpoint: str = None, latest: bool = False, base_dir: str = "checkpoints/v2/atari") -> str:
     """
     Resolve the model path based on arguments.
     
     Args:
         run: Run directory name (e.g., "20260108_164547") or None for latest
-        checkpoint: Checkpoint name (e.g., "epoch20") or None for latest in run
+        checkpoint: Checkpoint name (e.g., "epoch20", "best") or None for latest in run
         latest: If True, use latest run and latest checkpoint
+        base_dir: Game-specific base directory (e.g., "checkpoints/v2/mspacman")
         
     Returns:
         Full path to checkpoint file
     """
     base_path = os.path.dirname(os.path.dirname(__file__))
+    runs_dir = get_runs_dir(base_dir)
     
     # If latest flag or run specified, use runs directory
     if latest or run:
-        run_name = run if run else get_latest_run()
-        run_path = os.path.join(base_path, RUNS_DIR, run_name)
+        run_name = run if run else get_latest_run(base_dir)
+        run_path = os.path.join(base_path, runs_dir, run_name)
         
         if checkpoint:
             # Specific checkpoint requested - try multiple naming conventions
             candidates = [
-                f"atari_world_model_hires_{checkpoint}.pt",  # epoch checkpoints
-                f"atari_world_model_{checkpoint}.pt",         # best checkpoint
+                f"atari_world_model_hires_{checkpoint}.pt",  # legacy epoch checkpoints
+                f"atari_world_model_{checkpoint}.pt",         # legacy best checkpoint
+                f"world_model_{checkpoint}.pt",               # game-agnostic
                 f"{checkpoint}.pt",                           # direct name
             ]
             for ckpt_name in candidates:
@@ -137,10 +187,16 @@ def resolve_model_path(run: str = None, checkpoint: str = None, latest: bool = F
             raise FileNotFoundError(f"Checkpoint not found: {checkpoint} in {run_path}\n  Tried: {candidates}")
         else:
             # Find latest checkpoint in run
-            return get_latest_checkpoint(run_name)
+            return get_latest_checkpoint(run_name, base_dir)
     
-    # Default: use the base checkpoint path
-    return os.path.join(base_path, "checkpoints/v2/atari/atari_world_model_hires.pt")
+    # Default: use the base checkpoint path (try game-agnostic then legacy)
+    default_path = os.path.join(base_path, base_dir, "world_model_hires.pt")
+    if os.path.exists(default_path):
+        return default_path
+    legacy_path = os.path.join(base_path, base_dir, "atari_world_model_hires.pt")
+    if os.path.exists(legacy_path):
+        return legacy_path
+    raise FileNotFoundError(f"No world model checkpoint found in {base_dir}")
 
 
 class AtariWorldPlayerHiRes:
@@ -148,9 +204,8 @@ class AtariWorldPlayerHiRes:
     
     def __init__(
         self,
-        game: str = "ALE/Breakout-v5",
-        vqvae_path: str = "checkpoints/v2/atari/atari_vqvae_hires.pt",
-        model_path: str = "checkpoints/v2/atari/atari_world_model_hires.pt",
+        game_config: dict,  # From GAME_CONFIGS
+        model_path: str,
         device: str = 'cuda',
         config: WorldModelConfig = None,  # Load from run dir if None
         # CLI overrides (None = use config value)
@@ -162,6 +217,10 @@ class AtariWorldPlayerHiRes:
         adaptive_temp: bool = None,
         temp_boost: float = None,
     ):
+        # Store game config
+        self.game_config = game_config
+        base_dir = game_config["base_dir"]
+        
         # Load config from checkpoint's run directory if not provided
         if config is None:
             config = get_config_for_checkpoint(model_path)
@@ -179,8 +238,11 @@ class AtariWorldPlayerHiRes:
         self.temp_boost = temp_boost if temp_boost is not None else getattr(config.inference, 'temp_boost', 0.3)
         
         self.device = device
-        self.game = game
+        self.game = game_config["env_name"]
         self.history_len = config.model.history_len
+        
+        # Resolve VQ-VAE path from base_dir
+        vqvae_path = self._find_vqvae(base_dir)
         
         # Load models
         print("Loading high-res models...")
@@ -188,16 +250,12 @@ class AtariWorldPlayerHiRes:
         self.world_model, self.n_actions = self._load_world_model(model_path)
         
         # Create real environment
-        print(f"Creating {game}...")
-        self.env = gym.make(game, frameskip=4)
+        print(f"Creating {self.game}...")
+        self.env = gym.make(self.game, frameskip=4)
         
-        # Action mapping for keyboard
-        # Breakout: 0=NOOP, 1=FIRE, 2=RIGHT, 3=LEFT
-        self.key_to_action = {
-            ' ': 1,      # Space = Fire
-            'right': 2,  # Right arrow
-            'left': 3,   # Left arrow
-        }
+        # Action mapping for keyboard (game-specific)
+        self.key_to_action = game_config["key_to_action"]
+        self.action_help = game_config["action_help"]
         
         # State
         self.real_frame = None
@@ -217,6 +275,22 @@ class AtariWorldPlayerHiRes:
         
         # Logit smoothing state (reduces mode-hopping/flicker)
         self.prev_logits = None
+    
+    def _find_vqvae(self, base_dir: str) -> str:
+        """Find VQ-VAE checkpoint in base directory."""
+        base_path = os.path.dirname(os.path.dirname(__file__))
+        
+        # Try modern naming first, then legacy
+        candidates = [
+            os.path.join(base_path, base_dir, "vqvae_hires.pt"),
+            os.path.join(base_path, base_dir, "atari_vqvae_hires.pt"),
+        ]
+        
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        
+        raise FileNotFoundError(f"No VQ-VAE checkpoint found in {base_dir}. Tried: {candidates}")
         
     def _load_vqvae(self, path: str) -> VQVAEHiRes:
         """Load VQ-VAE with flexible input size."""
@@ -225,12 +299,21 @@ class AtariWorldPlayerHiRes:
         # Get dimensions from checkpoint
         input_h = ckpt.get('input_h', 84)
         input_w = ckpt.get('input_w', 64)
-        n_embeddings = ckpt.get('n_embeddings', 64)  # Load from checkpoint (v2.22: default to 64)
+        n_embeddings = ckpt.get('n_embeddings', 64)
         self.input_size = (input_h, input_w)
         self.n_embeddings = n_embeddings
         
+        # Infer hidden_channels from layer shapes if not saved
+        hidden_channels = ckpt.get('hidden_channels', None)
+        if hidden_channels is None:
+            initial_weight = ckpt['model_state_dict'].get('encoder.initial.weight')
+            if initial_weight is not None:
+                hidden_channels = initial_weight.shape[0]
+            else:
+                hidden_channels = 64  # fallback default
+        
         model = VQVAEHiRes(
-            in_channels=3, hidden_channels=64, latent_channels=256,
+            in_channels=3, hidden_channels=hidden_channels, latent_channels=256,
             n_embeddings=n_embeddings, n_residual=2,
             input_size=self.input_size,
         ).to(self.device)
@@ -244,7 +327,7 @@ class AtariWorldPlayerHiRes:
         # Store embeddings for candidate selection (embedding distance scoring)
         self.vqvae_embeddings = model.quantizer.embedding.weight.detach()  # (n_codes, D)
         
-        print(f"  Loaded VQ-VAE ({input_h}x{input_w} -> {self.token_h}x{self.token_w} tokens, {n_embeddings} codes)")
+        print(f"  Loaded VQ-VAE ({input_h}x{input_w} -> {self.token_h}x{self.token_w} tokens, {n_embeddings} codes, hidden={hidden_channels})")
         return model
     
     def _load_world_model(self, path: str):
@@ -511,7 +594,7 @@ class AtariWorldPlayerHiRes:
         ax_div.set_title('AI Drift from Reality')
         line_div, = ax_div.plot([], [], 'r-', linewidth=2)
         
-        fig.suptitle(f"{self.game} | SPACE=Fire  ←→=Move  P=Pause  R=Sync  Q=Quit | {self.target_fps:.0f} FPS", fontsize=10)
+        fig.suptitle(f"{self.game} | {self.action_help}  P=Pause  R=Sync  Q=Quit | {self.target_fps:.0f} FPS", fontsize=10)
         
         # Disable default key shortcuts
         for key in ['s', 'l', 'g', 'p']:
@@ -594,19 +677,28 @@ class AtariWorldPlayerHiRes:
 def main():
     import argparse
     
+    available_games = ", ".join(GAME_CONFIGS.keys())
+    
     parser = argparse.ArgumentParser(
         description='Play Atari with World Model',
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+        epilog=f"""
 Examples:
-  python play_atari_hires.py --latest              # Latest checkpoint from latest run
-  python play_atari_hires.py --run 20260108_164547 # Latest checkpoint from specific run  
-  python play_atari_hires.py --run 20260108_164547 --checkpoint epoch20
+  python play_atari_hires.py --game breakout --latest     # Breakout with latest checkpoint
+  python play_atari_hires.py --game mspacman --latest     # Ms. Pac-Man with latest checkpoint
+  python play_atari_hires.py --run 20260108_164547        # Specific run (default: breakout)
+  python play_atari_hires.py --run 20260108_164547 --checkpoint best
+
+Available games: {available_games}
 
 Inference settings are loaded from the run's config.json by default.
 Use --stochastic, --temperature, --top-k to override.
         """
     )
+    
+    # Game selection
+    parser.add_argument('--game', type=str, default=DEFAULT_GAME,
+                        help=f'Game to play ({available_games}). Default: {DEFAULT_GAME}')
     
     # Checkpoint selection
     parser.add_argument('--latest', action='store_true',
@@ -614,7 +706,7 @@ Use --stochastic, --temperature, --top-k to override.
     parser.add_argument('--run', type=str, default=None,
                         help='Run directory name (e.g., 20260108_164547)')
     parser.add_argument('--checkpoint', type=str, default=None,
-                        help='Checkpoint name within run (e.g., epoch20)')
+                        help='Checkpoint name within run (e.g., epoch20, best)')
     parser.add_argument('--model-path', type=str, default=None,
                         help='Direct path to model checkpoint (overrides --run/--latest)')
     
@@ -642,6 +734,10 @@ Use --stochastic, --temperature, --top-k to override.
     
     os.chdir(os.path.dirname(os.path.dirname(__file__)))
     
+    # Get game configuration
+    game_config = get_game_config(args.game)
+    base_dir = game_config["base_dir"]
+    
     # Resolve model path
     if args.model_path:
         model_path = args.model_path
@@ -649,7 +745,8 @@ Use --stochastic, --temperature, --top-k to override.
         model_path = resolve_model_path(
             run=args.run,
             checkpoint=args.checkpoint,
-            latest=args.latest
+            latest=args.latest,
+            base_dir=base_dir
         )
     
     # Determine deterministic override (only if explicitly set)
@@ -667,10 +764,12 @@ Use --stochastic, --temperature, --top-k to override.
         adaptive_temp_override = False
     
     print(f"\n{'='*60}")
+    print(f"Game: {args.game} ({game_config['env_name']})")
     print(f"Model: {model_path}")
     print(f"{'='*60}")
     
     player = AtariWorldPlayerHiRes(
+        game_config=game_config,
         model_path=model_path,
         deterministic=deterministic_override,
         temperature=args.temperature,

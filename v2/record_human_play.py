@@ -1,21 +1,31 @@
 """
 Record Human Gameplay
 =====================
-Play Breakout yourself and record frames for the world model.
+Play Atari games and record frames for the world model.
+
+Usage:
+  python record_human_play.py --game mspacman
+  python record_human_play.py --game breakout
 
 Controls:
-  LEFT ARROW  = Move paddle left
-  RIGHT ARROW = Move paddle right  
-  SPACE       = Fire (launch ball)
-  R           = Start/Stop RECORDING
-  S           = SAVE recorded data
-  Q           = Quit (saves automatically)
+  Breakout:
+    LEFT/RIGHT = Move paddle
+    SPACE = Fire (launch ball)
+  
+  Ms. Pac-Man:
+    Arrow Keys = Move (UP/DOWN/LEFT/RIGHT)
+
+  Common:
+    R = Start/Stop RECORDING
+    S = SAVE recorded data
+    Q = Quit (saves automatically)
 
 Frames are saved in the same format as the training data.
 """
 
 import os
 import sys
+import argparse
 import numpy as np
 import cv2
 import time
@@ -34,14 +44,48 @@ except ImportError as e:
     sys.exit(1)
 
 
-def save_data(frames, actions, rewards, dones, episode_starts, target_size):
+# =============================================================================
+# Game Configuration
+# =============================================================================
+
+GAME_CONFIGS = {
+    "breakout": {
+        "env_name": "ALE/Breakout-v5",
+        "base_dir": "checkpoints/v2/atari",
+        "n_actions": 4,
+        "controls": {
+            pygame.K_LEFT: 3,   # LEFT
+            pygame.K_RIGHT: 2,  # RIGHT
+            pygame.K_SPACE: 1,  # FIRE
+        },
+        "control_help": "LEFT/RIGHT=Move, SPACE=Fire",
+    },
+    "mspacman": {
+        "env_name": "ALE/MsPacman-v5",
+        "base_dir": "checkpoints/v2/mspacman",
+        "n_actions": 9,
+        "controls": {
+            pygame.K_UP: 1,     # UP
+            pygame.K_RIGHT: 2,  # RIGHT
+            pygame.K_LEFT: 3,   # LEFT
+            pygame.K_DOWN: 4,   # DOWN
+        },
+        "control_help": "Arrow Keys=Move",
+    },
+}
+
+
+def save_data(frames, actions, rewards, dones, episode_starts, target_size, game_config):
     """Save recorded data to file."""
     if len(actions) == 0:
         print("No frames to save.")
         return
     
-    save_path = "checkpoints/v2/atari/human_gameplay.npz"
+    save_path = os.path.join(game_config["base_dir"], "human_gameplay.npz")
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    
+    n_actions = game_config["n_actions"]
+    game_name = game_config["env_name"]
     
     # Check if file exists and merge
     if os.path.exists(save_path):
@@ -58,8 +102,8 @@ def save_data(frames, actions, rewards, dones, episode_starts, target_size):
             'rewards': np.concatenate([existing['rewards'], np.array(rewards, dtype=np.float32)]),
             'dones': np.concatenate([existing['dones'], np.array(dones, dtype=bool)]),
             'episode_starts': np.concatenate([existing['episode_starts'], np.array(new_ep_starts, dtype=np.int32)]),
-            'n_actions': 4,
-            'game': 'ALE/Breakout-v5',
+            'n_actions': n_actions,
+            'game': game_name,
             'frame_size': target_size,
         }
     else:
@@ -69,48 +113,57 @@ def save_data(frames, actions, rewards, dones, episode_starts, target_size):
             'rewards': np.array(rewards, dtype=np.float32),
             'dones': np.array(dones, dtype=bool),
             'episode_starts': np.array(episode_starts, dtype=np.int32),
-            'n_actions': 4,
-            'game': 'ALE/Breakout-v5',
+            'n_actions': n_actions,
+            'game': game_name,
             'frame_size': target_size,
         }
     
     np.savez_compressed(save_path, **data)
-    print(f"Saved! Total frames: {len(data['frames'])}")
+    print(f"Saved to {save_path}! Total frames: {len(data['frames'])}")
 
 
 def main():
+    parser = argparse.ArgumentParser(description='Record human gameplay for world model training')
+    parser.add_argument('--game', type=str, default='breakout', 
+                        help=f'Game to play ({", ".join(GAME_CONFIGS.keys())})')
+    args = parser.parse_args()
+    
+    game = args.game.lower()
+    if game not in GAME_CONFIGS:
+        print(f"Unknown game '{game}'. Available: {', '.join(GAME_CONFIGS.keys())}")
+        sys.exit(1)
+    
+    game_config = GAME_CONFIGS[game]
+    
     print("=" * 60)
-    print("Human Gameplay Recorder")
+    print(f"Human Gameplay Recorder - {game.upper()}")
     print("=" * 60)
-    print("\nControls:")
-    print("  LEFT/RIGHT arrows = Move paddle")
-    print("  SPACE = Fire (launch ball)")
+    print(f"\nGame: {game_config['env_name']}")
+    print(f"Controls: {game_config['control_help']}")
+    print("\nRecording Controls:")
     print("  R = Start/Stop RECORDING")
     print("  S = SAVE recorded data")
-    print("  Q = Quit")
+    print("  Q = Quit (auto-saves)")
     print("=" * 60)
     
     # Setup
     config = AtariConfig(
-        game='ALE/Breakout-v5',
+        game=game_config["env_name"],
         preserve_aspect=True,
         target_width=64,
     )
     target_size = config.target_size  # (84, 64)
     
     # Create environment with RGB rendering
-    # frameskip=4 means each action repeats for 4 frames (standard Atari)
-    env = gym.make('ALE/Breakout-v5', render_mode='rgb_array', frameskip=4)
+    env = gym.make(game_config["env_name"], render_mode='rgb_array', frameskip=4)
     
     # Setup pygame for keyboard input
     pygame.init()
-    # Atari obs is (210, 160, 3) = H x W x C
-    # Scale 3x: display is 480 wide x 630 tall
     SCALE = 3
     DISPLAY_W = 160 * SCALE  # 480
     DISPLAY_H = 210 * SCALE  # 630
     screen = pygame.display.set_mode((DISPLAY_W, DISPLAY_H))
-    pygame.display.set_caption("Breakout - Press R to Record")
+    pygame.display.set_caption(f"{game.upper()} - Press R to Record")
     clock = pygame.time.Clock()
     
     # Storage
@@ -136,6 +189,8 @@ def main():
     episode_count = 0
     recorded_frames = 0
     
+    controls = game_config["controls"]
+    
     print(f"\nPress R to start recording...")
     
     while running:
@@ -157,23 +212,21 @@ def main():
                         frames.append(preprocess(obs))
                         episode_count += 1
                         print(f"RECORDING started - Episode {episode_count}")
-                        pygame.display.set_caption("Breakout - *** RECORDING *** (R to stop)")
+                        pygame.display.set_caption(f"{game.upper()} - *** RECORDING *** (R to stop)")
                     else:
                         print(f"Recording PAUSED - {len(frames)} frames captured")
-                        pygame.display.set_caption("Breakout - PAUSED (R to record, S to save)")
+                        pygame.display.set_caption(f"{game.upper()} - PAUSED (R to record, S to save)")
                 elif event.key == pygame.K_s:
                     # Save data
                     print("Saving...")
-                    save_data(frames, actions, rewards, dones, episode_starts, target_size)
+                    save_data(frames, actions, rewards, dones, episode_starts, target_size, game_config)
         
         # Check held keys for movement
         keys = pygame.key.get_pressed()
-        if keys[pygame.K_LEFT]:
-            action = 3  # LEFT
-        elif keys[pygame.K_RIGHT]:
-            action = 2  # RIGHT
-        elif keys[pygame.K_SPACE]:
-            action = 1  # FIRE
+        for key, act in controls.items():
+            if keys[key]:
+                action = act
+                break  # Use first matching key
         
         # Step environment
         obs, reward, terminated, truncated, info = env.step(action)
@@ -192,9 +245,8 @@ def main():
         step += 1
         
         # Display - cv2.resize takes (width, height)
-        display_frame = cv2.resize(obs, (DISPLAY_W, DISPLAY_H))  # Output: (DISPLAY_H, DISPLAY_W, 3)
-        # Pygame surfarray expects (width, height, 3), numpy gives (height, width, 3)
-        display_frame = np.transpose(display_frame, (1, 0, 2))  # Now (DISPLAY_W, DISPLAY_H, 3)
+        display_frame = cv2.resize(obs, (DISPLAY_W, DISPLAY_H))
+        display_frame = np.transpose(display_frame, (1, 0, 2))
         surface = pygame.surfarray.make_surface(display_frame)
         screen.blit(surface, (0, 0))
         
@@ -205,14 +257,12 @@ def main():
         if recording:
             rec_text = font.render("*** RECORDING ***", True, (255, 0, 0))
             screen.blit(rec_text, (10, 10))
-            y_offset = 45
         else:
             rec_text = font.render("PAUSED (R=record, S=save, Q=quit)", True, (255, 255, 0))
             screen.blit(rec_text, (10, 10))
-            y_offset = 45
         
         text = font.render(f"Score: {int(episode_reward)}  Recorded: {recorded_frames} frames", True, (255, 255, 255))
-        screen.blit(text, (10, y_offset))
+        screen.blit(text, (10, 45))
         
         pygame.display.flip()
         
@@ -228,7 +278,7 @@ def main():
                 frames.append(preprocess(obs))
                 print(f"Recording... Episode {episode_count}")
         
-        clock.tick(15)  # 15 FPS for playable speed (with frameskip=4, feels like 60Hz)
+        clock.tick(15)  # 15 FPS for playable speed
     
     pygame.quit()
     env.close()
@@ -236,11 +286,10 @@ def main():
     # Auto-save on quit if there's unsaved data
     if len(actions) > 0:
         print(f"\nAuto-saving {len(frames)} frames...")
-        save_data(frames, actions, rewards, dones, episode_starts, target_size)
+        save_data(frames, actions, rewards, dones, episode_starts, target_size, game_config)
     else:
         print("No frames recorded.")
 
 
 if __name__ == "__main__":
     main()
-
