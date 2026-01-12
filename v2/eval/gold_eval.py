@@ -246,7 +246,7 @@ def eval_one_step(
             batch_target = torch.stack(batch_target).to(device)  # (B, N)
             
             with torch.amp.autocast('cuda'):
-                logits, loss = model(batch_hist, batch_act, batch_target)
+                logits, loss, _ = model(batch_hist, batch_act, batch_target)
             
             total_loss += loss.item() * len(batch_idx)
             
@@ -305,7 +305,7 @@ def eval_rollout(
                 target = tokens[target_idx].unsqueeze(0).to(device)
                 
                 with torch.amp.autocast('cuda'):
-                    logits, _ = model(current_history, action_tensor, None)
+                    logits, _, _ = model(current_history, action_tensor, None)
                 
                 preds = logits.argmax(dim=-1)  # (1, N)
                 
@@ -396,14 +396,14 @@ def eval_mirror_consistency(
             
             # Original prediction
             with torch.amp.autocast('cuda'):
-                logits_orig, _ = model(batch_hist, batch_act, None)  # (B, N, vocab)
+                logits_orig, _, _ = model(batch_hist, batch_act, None)  # (B, N, vocab)
             
             # Flipped prediction: flip history, swap action
             hist_flip = flip_tokens_h(batch_hist, token_h, token_w)
             act_swap = swap_lr_action(batch_act)
             
             with torch.amp.autocast('cuda'):
-                logits_flip, _ = model(hist_flip, act_swap, None)
+                logits_flip, _, _ = model(hist_flip, act_swap, None)
             
             # Unflip the flipped prediction to compare
             logits_flip_unflip = flip_tokens_h(
@@ -423,8 +423,8 @@ def eval_mirror_consistency(
             # Action sensitivity: KL(LEFT || RIGHT) for same history
             # Higher = actions matter more
             with torch.amp.autocast('cuda'):
-                logits_left, _ = model(batch_hist, torch.full_like(batch_act, 3), None)
-                logits_right, _ = model(batch_hist, torch.full_like(batch_act, 2), None)
+                logits_left, _, _ = model(batch_hist, torch.full_like(batch_act, 3), None)
+                logits_right, _, _ = model(batch_hist, torch.full_like(batch_act, 2), None)
             
             probs_left = F.softmax(logits_left.float(), dim=-1)
             probs_right = F.softmax(logits_right.float(), dim=-1)

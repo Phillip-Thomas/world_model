@@ -24,6 +24,11 @@ v2.1: Multi-step rollout improvements
       - Token importance weights applied per rollout step
       - Efficient history update using roll() instead of cat()
       - Frame/action alignment assertion
+
+v3.0: MDP Model Training
+      - Reward prediction: two-headed (sign classification + magnitude regression)
+      - Done prediction: binary classification
+      - Combined loss: tokens + 0.1*reward + 0.1*done
 """
 
 import os
@@ -73,27 +78,35 @@ def multistep_rollout_loss(
     # v3.0: Focal loss
     use_focal_loss: bool = True,
     focal_gamma: float = 2.0,
+    # v3.0 MDP: Reward/done targets
+    target_rewards: torch.Tensor = None,  # (B, K) rewards for each step
+    target_dones: torch.Tensor = None,    # (B, K) done flags for each step
 ) -> tuple:
     """
     Compute multi-step rollout loss with discounted step weights.
     
     v1.9: Later steps weighted less (1.0, 0.7, 0.49, 0.34, ...)
     v2.1: Normalized loss, scheduled sampling, importance weighting per step.
+    v3.0: MDP model - includes reward and done prediction losses.
     
     Key improvements:
     - Loss normalized by weight sum (stable across K / discount values)
     - Teacher forcing mix (prevents "ball death spiral" early in training)
     - Token importance weights applied per rollout step
     - Efficient history update using roll() instead of cat()
+    - Reward/done prediction losses (v3.0)
     
     Returns:
         total_loss: normalized discounted sum of losses across all steps
         step_accuracies: list of accuracies at each step
+        aux_losses: dict with reward/done loss components (if targets provided)
     """
     B, T, N = history.shape
     K = actions.shape[1]
     
     total_loss = 0.0
+    total_reward_loss = 0.0
+    total_done_loss = 0.0
     weight_sum = 0.0  # v2.1: track for normalization
     step_accs = []
     current_history = history.clone()
@@ -104,8 +117,16 @@ def multistep_rollout_loss(
         action_k = actions[:, k]  # (B,)
         target_k = targets[:, k].contiguous()  # (B, N)
         
-        # Forward pass
-        logits, _ = model(current_history, action_k, None)  # (B, N, vocab)
+        # Get reward/done targets for this step if provided
+        reward_k = target_rewards[:, k] if target_rewards is not None else None
+        done_k = target_dones[:, k] if target_dones is not None else None
+        
+        # Forward pass with reward/done if available
+        logits, step_loss, aux = model(
+            current_history, action_k, target_k,
+            target_rewards=reward_k,
+            target_dones=done_k,
+        )  # (B, N, vocab)
         
         # v2.1: Compute token importance weights if enabled
         if use_importance_weights and token_embedding is not None:
@@ -118,7 +139,7 @@ def multistep_rollout_loss(
             )
             # v3.0: Focal loss + motion weights
             if use_focal_loss:
-                loss = focal_loss_with_motion_weights(
+                token_loss = focal_loss_with_motion_weights(
                     logits, target_k, token_weights, gamma=focal_gamma
                 )
             else:
@@ -128,16 +149,26 @@ def multistep_rollout_loss(
                     target_k.reshape(-1),
                     reduction='none'
                 ).reshape(B, N)
-                loss = (ce_per_token * token_weights).mean()
+                token_loss = (ce_per_token * token_weights).mean()
         else:
             # Standard CE loss (no weighting)
             if use_focal_loss:
-                loss = focal_loss_per_token(logits, target_k, gamma=focal_gamma, reduction='mean')
+                token_loss = focal_loss_per_token(logits, target_k, gamma=focal_gamma, reduction='mean')
             else:
-                loss = F.cross_entropy(
+                token_loss = F.cross_entropy(
                     logits.reshape(-1, logits.size(-1)),
                     target_k.reshape(-1),
                 )
+        
+        # Combine token loss with reward/done losses from model forward
+        loss = token_loss
+        if aux is not None:
+            if 'reward_loss' in aux:
+                loss = loss + 0.1 * aux['reward_loss']
+                total_reward_loss += step_weight * aux['reward_loss'].item()
+            if 'done_loss' in aux:
+                loss = loss + 0.1 * aux['done_loss']
+                total_done_loss += step_weight * aux['done_loss'].item()
         
         total_loss = total_loss + step_weight * loss
         weight_sum += step_weight  # v2.1: accumulate for normalization
@@ -168,7 +199,14 @@ def multistep_rollout_loss(
     # v2.1: Normalize loss by weight sum (keeps scale stable across K / discount)
     total_loss = total_loss / (weight_sum + 1e-8)
     
-    return total_loss, step_accs
+    # v3.0: Return auxiliary losses for monitoring
+    aux_losses = {}
+    if target_rewards is not None:
+        aux_losses['reward_loss'] = total_reward_loss / (weight_sum + 1e-8)
+    if target_dones is not None:
+        aux_losses['done_loss'] = total_done_loss / (weight_sum + 1e-8)
+    
+    return total_loss, step_accs, aux_losses
 
 
 # Default runs directory (can be overridden by base_dir parameter)
@@ -547,6 +585,7 @@ def train_world_model_hires(
             episode_starts=data['episode_starts'],
             history_len=4,
             rollout_steps=rollout_steps,
+            rewards=data['rewards'],  # v3.0: Include rewards for MDP training
         )
         # Use smaller batch size for multi-step (more memory)
         ms_batch_size = max(8, batch_size // 2)
@@ -662,10 +701,14 @@ def train_world_model_hires(
         
         effective_batches = min(max_batches, len(train_loader)) if max_batches > 0 else len(train_loader)
         pbar = tqdm(train_loader, desc=f"Epoch {actual_epoch+1}/{start_epoch+n_epochs}", total=effective_batches)
-        for batch_hist, batch_act, batch_target in pbar:
+        for batch_data in pbar:
+            # v3.0: Dataset now returns 5-tuple (history, action, target, reward, done)
+            batch_hist, batch_act, batch_target, batch_reward, batch_done = batch_data
             batch_hist = batch_hist.to(device)
             batch_act = batch_act.to(device)
             batch_target = batch_target.to(device)
+            batch_reward = batch_reward.to(device)
+            batch_done = batch_done.to(device)
             
             # Decide: single-step or multi-step?
             use_multistep = (
@@ -676,17 +719,21 @@ def train_world_model_hires(
             if use_multistep:
                 # === Multi-step rollout training ===
                 try:
-                    ms_hist, ms_acts, ms_targets = next(ms_iter)
+                    ms_data = next(ms_iter)
                 except StopIteration:
                     ms_iter = iter(multistep_loader)
-                    ms_hist, ms_acts, ms_targets = next(ms_iter)
+                    ms_data = next(ms_iter)
                 
+                # v3.0: Multi-step dataset now returns 5-tuple
+                ms_hist, ms_acts, ms_targets, ms_rewards, ms_dones = ms_data
                 ms_hist = ms_hist.to(device)
                 ms_acts = ms_acts.to(device)
                 ms_targets = ms_targets.to(device)
+                ms_rewards = ms_rewards.to(device) if ms_rewards is not None else None
+                ms_dones = ms_dones.to(device)
                 
                 with torch.amp.autocast('cuda'):
-                    loss, step_accs = multistep_rollout_loss(
+                    loss, step_accs, aux_losses = multistep_rollout_loss(
                         model, ms_hist, ms_acts, ms_targets, device,
                         teacher_forcing_prob=teacher_forcing_prob,
                         token_embedding=vqvae.quantizer.embedding,  # VQ-VAE codebook (stable, visual similarity)
@@ -697,6 +744,8 @@ def train_world_model_hires(
                         max_ratio=max_ratio,
                         use_focal_loss=use_focal_loss,
                         focal_gamma=focal_gamma,
+                        target_rewards=ms_rewards,  # v3.0 MDP
+                        target_dones=ms_dones,      # v3.0 MDP
                     )
                 
                 optimizer.zero_grad()
@@ -714,11 +763,17 @@ def train_world_model_hires(
                 ms_batches += 1
                 
                 # CRITICAL: Free multi-step tensors immediately
-                del loss, step_accs, ms_hist, ms_acts, ms_targets
+                del loss, step_accs, aux_losses, ms_hist, ms_acts, ms_targets, ms_rewards, ms_dones
             else:
                 # === Standard single-step training with token importance weighting ===
                 with torch.amp.autocast('cuda'):
-                    logits, _ = model(batch_hist, batch_act, None)  # Get logits without loss
+                    # v3.0: Pass reward/done targets for MDP training
+                    logits, model_loss, aux = model(
+                        batch_hist, batch_act, None,
+                        target_rewards=batch_reward,
+                        target_dones=batch_done,
+                        compute_reward_done=True,
+                    )
                     
                     # v2.0: Compute hybrid token importance weights
                     token_weights = compute_token_importance_weights(
@@ -739,7 +794,7 @@ def train_world_model_hires(
                     # v3.0: Focal loss + motion weights (or standard weighted CE)
                     if use_focal_loss:
                         # Focal loss automatically upweights hard tokens
-                        loss = focal_loss_with_motion_weights(
+                        token_loss = focal_loss_with_motion_weights(
                             logits, batch_target, token_weights, gamma=focal_gamma
                         )
                     else:
@@ -749,7 +804,15 @@ def train_world_model_hires(
                             batch_target.reshape(-1),
                             reduction='none'
                         ).reshape_as(batch_target)  # (B, N)
-                        loss = (ce_per_token * token_weights).mean()
+                        token_loss = (ce_per_token * token_weights).mean()
+                    
+                    # v3.0: Combine token loss with reward/done losses from model
+                    loss = token_loss
+                    if aux is not None:
+                        if 'reward_loss' in aux:
+                            loss = loss + 0.1 * aux['reward_loss']
+                        if 'done_loss' in aux:
+                            loss = loss + 0.1 * aux['done_loss']
                 
                 optimizer.zero_grad()
                 scaler.scale(loss).backward()
@@ -765,7 +828,7 @@ def train_world_model_hires(
                 train_total += batch_target.numel()
                 
                 # Free single-step tensors (ce_per_token only exists in non-focal path)
-                del loss, logits, preds, token_weights
+                del loss, logits, preds, token_weights, aux
             
             batch_count += 1
             
@@ -811,13 +874,15 @@ def train_world_model_hires(
         n_entropy_samples = 0
         
         with torch.no_grad():
-            for batch_hist, batch_act, batch_target in fast_val_loader:
+            for batch_data in fast_val_loader:
+                # v3.0: Dataset now returns 5-tuple
+                batch_hist, batch_act, batch_target, batch_reward, batch_done = batch_data
                 batch_hist = batch_hist.to(device)
                 batch_act = batch_act.to(device)
                 batch_target = batch_target.to(device)
                 
                 with torch.amp.autocast('cuda'):
-                    logits, _ = model(batch_hist, batch_act, None)
+                    logits, _, _ = model(batch_hist, batch_act, None)
                     loss = F.cross_entropy(logits.view(-1, model.n_vocab), batch_target.view(-1))
                 
                 fast_val_loss_sum += loss.item()
@@ -1198,7 +1263,7 @@ def _plot_rollout_comparison(model, vqvae, val_dataset, device, save_dir, rollou
                 gt_frames.append(gt_img)
                 
                 # Model prediction
-                logits, _ = model(current_history, action_k, None)
+                logits, _, _ = model(current_history, action_k, None)
                 pred_tokens = logits.argmax(dim=-1)  # (1, N)
                 
                 # Decode prediction

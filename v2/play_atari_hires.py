@@ -532,7 +532,7 @@ class AtariWorldPlayerHiRes:
         with torch.no_grad():
             # Predict next tokens directly from token history
             action_tensor = torch.tensor([action], device=self.device)
-            logits, _ = self.world_model(self.token_history, action_tensor, None)
+            logits, _, _ = self.world_model(self.token_history, action_tensor, None)
             
             # Logit smoothing: blend with previous logits to reduce mode-hopping/flicker
             if self.logit_smoothing > 0 and self.prev_logits is not None:

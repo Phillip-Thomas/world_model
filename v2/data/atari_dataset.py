@@ -422,8 +422,9 @@ class AtariTemporalDataset(Dataset):
             self.frames = data['frames']
         
         self.actions = torch.from_numpy(data['actions'].astype(np.int64)).long()
-        self.rewards = data['rewards']
-        self.dones = np.array(data['dones'], dtype=bool)
+        self.rewards = torch.from_numpy(data['rewards'].astype(np.float32))
+        self.dones = torch.from_numpy(data['dones'].astype(np.float32))  # Float for BCE loss
+        self._dones_bool = np.array(data['dones'], dtype=bool)  # Keep bool for indexing
         self.n_actions = data['n_actions']  # Must be in dataset (game-agnostic)
         
         n = len(self.actions)
@@ -433,7 +434,7 @@ class AtariTemporalDataset(Dataset):
         # This equals the number of "extra" initial frames before action i
         self.episode_id = np.zeros(n, dtype=np.int64)
         if n > 1:
-            self.episode_id[1:] = np.cumsum(self.dones[:-1].astype(np.int64))
+            self.episode_id[1:] = np.cumsum(self._dones_bool[:-1].astype(np.int64))
         
         # v4 FIX: Map action index -> frame index in concatenated array
         # frame_index[i] = i + episode_id[i]
@@ -441,7 +442,7 @@ class AtariTemporalDataset(Dataset):
         
         # v4 FIX: Episode start (in action-index space) for each action
         # First action of each episode is right after a done (or at index 0)
-        episode_start_mask = np.concatenate([[True], self.dones[:-1]])
+        episode_start_mask = np.concatenate([[True], self._dones_bool[:-1]])
         episode_starts_action = np.where(episode_start_mask)[0]
         # For each action i, find which episode it belongs to and get that episode's start
         self.episode_start_action = episode_starts_action[self.episode_id]
@@ -495,7 +496,7 @@ class AtariTemporalDataset(Dataset):
         
         for i in range(n):
             # Skip terminal states - no meaningful next state
-            if self.dones[i]:
+            if self._dones_bool[i]:
                 continue
             
             # History needs (history_len) frames ending at frame_index[i]
@@ -517,7 +518,7 @@ class AtariTemporalDataset(Dataset):
     def __len__(self):
         return len(self.valid_indices)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Get a training sample with v4 correct frame indexing.
         
@@ -526,16 +527,24 @@ class AtariTemporalDataset(Dataset):
         - history = frames[fi - history_len + 1 : fi + 1]
         - action = actions[i]
         - next_frame = frames[fi + 1]
+        - reward = rewards[i] (reward from taking action i)
+        - done = dones[i] (whether this transition ended the episode)
+        
+        v2.0: Now returns 5-tuple (history, action, next_frame, reward, done) for MDP training.
         """
         i = self.valid_indices[idx]
         fi = self.frame_index[i]
         start_f = fi - self.history_len + 1
         
+        # Reward and done are aligned with action index
+        reward = self.rewards[i]
+        done = self.dones[i]
+        
         if self.preprocessed_tokens:
             history = self.frames[start_f:fi + 1]  # (T, n_tokens)
             action = self.actions[i]
             next_frame = self.frames[fi + 1]
-            return history, action, next_frame
+            return history, action, next_frame, reward, done
         
         # Raw frames path
         block = self.frames[start_f:fi + 2]  # (T+1, H, W, C) uint8
@@ -554,7 +563,7 @@ class AtariTemporalDataset(Dataset):
             history = history.float() / 127.5 - 1.0
             next_frame = next_frame.float() / 127.5 - 1.0
         
-        return history, action, next_frame
+        return history, action, next_frame, reward, done
     
     def get_sampler(self, replacement: bool = True) -> WeightedRandomSampler:
         weights = torch.from_numpy(self.valid_weights).double()

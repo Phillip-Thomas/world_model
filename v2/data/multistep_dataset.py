@@ -1,9 +1,10 @@
 """
-Multi-Step Rollout Dataset (v4)
-===============================
+Multi-Step Rollout Dataset (v4.1 - MDP)
+=======================================
 Dataset for K-step rollout training with correct episode boundary handling.
 
 v4 FIX: Correct frame/action alignment across episodes.
+v4.1: Returns rewards and dones for MDP training.
 Uses episode_id to map action indices to frame indices.
 """
 
@@ -14,9 +15,10 @@ from torch.utils.data import Dataset
 
 class MultiStepDataset(Dataset):
     """
-    Dataset that returns K consecutive (history, action, target) tuples.
+    Dataset that returns K consecutive (history, action, target, reward, done) tuples.
     
     v4 FIX: Correct frame/action alignment across episodes.
+    v4.1: Returns rewards and dones for MDP model training.
     Uses episode_id to map action indices to frame indices.
     
     Used for multi-step rollout training where we:
@@ -33,36 +35,39 @@ class MultiStepDataset(Dataset):
         episode_starts: np.ndarray,  # Not used in v4, kept for compatibility
         history_len: int = 4,
         rollout_steps: int = 4,  # K steps to unroll
+        rewards: np.ndarray = None,  # (N_actions,) rewards - optional for backward compat
     ):
         self.tokens = torch.from_numpy(tokens).long()
         self.actions = torch.from_numpy(actions.astype(np.int64)).long()
-        self.dones = np.array(dones, dtype=bool)
+        self._dones_bool = np.array(dones, dtype=bool)  # For indexing
+        self.dones = torch.from_numpy(dones.astype(np.float32))  # For loss
+        self.rewards = torch.from_numpy(rewards.astype(np.float32)) if rewards is not None else None
         self.history_len = history_len
         self.rollout_steps = rollout_steps
         self.token_shape = tokens.shape[1:] if tokens.ndim > 1 else ()
         
         n = len(self.actions)
         n_frames = len(self.tokens)
-        n_episodes = int(self.dones.sum()) + 1
+        n_episodes = int(self._dones_bool.sum()) + 1
         
         # v2.1: Alignment assertion
         expected_frames = n + n_episodes
         if abs(n_frames - expected_frames) > n_episodes:
             print(f"  [WARNING] Frame/action alignment may be off:")
             print(f"    Frames: {n_frames}, Actions: {n}, Episodes: {n_episodes}")
-            print(f"    Expected frames ≈ {expected_frames} (actions + episodes)")
+            print(f"    Expected frames ~= {expected_frames} (actions + episodes)")
             print(f"    Diff: {n_frames - expected_frames}")
         
         # v4 FIX: Compute episode_id for each action index
         self.episode_id = np.zeros(n, dtype=np.int64)
         if n > 1:
-            self.episode_id[1:] = np.cumsum(self.dones[:-1].astype(np.int64))
+            self.episode_id[1:] = np.cumsum(self._dones_bool[:-1].astype(np.int64))
         
         # v4 FIX: Map action index -> frame index
         self.frame_index = np.arange(n, dtype=np.int64) + self.episode_id
         
         # v4 FIX: Episode start (in action-index space) for each action
-        episode_start_mask = np.concatenate([[True], self.dones[:-1]])
+        episode_start_mask = np.concatenate([[True], self._dones_bool[:-1]])
         episode_starts_action = np.where(episode_start_mask)[0]
         self.episode_start_action = episode_starts_action[self.episode_id]
         
@@ -81,7 +86,7 @@ class MultiStepDataset(Dataset):
             if i + self.rollout_steps > n:
                 continue
             
-            if self.dones[i:i + self.rollout_steps - 1].any():
+            if self._dones_bool[i:i + self.rollout_steps - 1].any():
                 continue
             
             history_start_action = i - self.history_len + 1
@@ -106,11 +111,14 @@ class MultiStepDataset(Dataset):
     def __getitem__(self, idx: int):
         """
         v4 FIX: Use frame_index for correct token indexing.
+        v4.1: Also returns rewards and dones for MDP training.
         
         Returns:
             history: (history_len, H*W) initial history tokens
             actions: (rollout_steps,) actions for each step
             targets: (rollout_steps, H*W) target tokens for each step
+            rewards: (rollout_steps,) rewards for each step (or None if not available)
+            dones: (rollout_steps,) done flags for each step (float for BCE loss)
         """
         i = self.valid_indices[idx]
         fi = self.frame_index[i]
@@ -129,4 +137,8 @@ class MultiStepDataset(Dataset):
         if targets.ndim > 1:
             targets = targets.reshape(self.rollout_steps, -1)
         
-        return history, actions, targets
+        # Rewards and dones for each step
+        rewards = self.rewards[i:i + self.rollout_steps] if self.rewards is not None else None
+        dones = self.dones[i:i + self.rollout_steps]
+        
+        return history, actions, targets, rewards, dones
