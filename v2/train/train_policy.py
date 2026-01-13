@@ -153,7 +153,7 @@ class DynaConfig:
     train_freq: int = 4               # Train every N environment steps
     batch_size: int = 1024             # Reduced for memory (was 256)
     gradient_steps: int = 2           # Single step to reduce memory
-    warmup_steps: int = 1000          # Reduced warmup (4 envs now)
+    warmup_steps: int = 5000          # 5k steps * 6 envs = 30k transitions (30% buffer fill)
     grad_clip: float = 10.0           # Gradient clipping for DQN stability
     
     # Dyna-specific (WM → Policy)
@@ -189,7 +189,7 @@ class DynaConfig:
     priority_beta_increment: float = 0.001  # Beta annealing rate
     
     # Buffers
-    real_buffer_size: int = 100000    # 100k transitions
+    real_buffer_size: int = 250000    # 250k transitions (larger to reduce forgetting)
     imagined_buffer_size: int = 50000 # 50k imagined transitions
     
     # Evaluation - reduced since stochastic env provides variance
@@ -197,7 +197,7 @@ class DynaConfig:
     eval_random_noops: int = 30       # Random no-ops at eval reset for stochasticity
     
     # DQN hyperparameters
-    learning_rate: float = 1e-4       # Reduced from 3e-4 for stability at longer training
+    learning_rate: float = 5e-5       # Lower LR to reduce catastrophic forgetting
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
@@ -1308,6 +1308,11 @@ def train_dyna(
                     train_dyna.best_wm_loss = avg_wm_loss
                     torch.save(world_model.state_dict(), f"{run_dir}/world_model_finetuned_best.pt")
                     print(f"    New best WM! Loss: {avg_wm_loss:.4f}")
+            
+            # Always save latest checkpoint (overwrite each epoch)
+            agent.save(f"{run_dir}/policy_latest.pt")
+            if config.wm_finetune:
+                torch.save(world_model.state_dict(), f"{run_dir}/world_model_latest.pt")
         except (RuntimeError, OSError) as e:
             print(f"    WARNING: Save failed (disk full?): {e}")
         

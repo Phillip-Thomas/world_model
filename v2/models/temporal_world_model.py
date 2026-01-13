@@ -250,14 +250,26 @@ class TemporalVisualWorldModel(nn.Module):
         loss = None
         aux = {}
         
-        # Token loss
+        # Token loss - compute per-sample for trust-weighted imagination
         if target_tokens is not None:
-            token_loss = F.cross_entropy(
-                logits.reshape(-1, self.n_vocab),  # Use reshape for non-contiguous tensors
-                target_tokens.reshape(-1),          # From replay buffer sampling
+            B = frame_history.shape[0]
+            
+            # Per-token loss (no reduction)
+            token_loss_per_token = F.cross_entropy(
+                logits.reshape(-1, self.n_vocab),  # (B*N, vocab)
+                target_tokens.reshape(-1),          # (B*N,)
+                reduction='none'
             )
+            
+            # Mean over tokens per sample → (B,) for trust calculation
+            token_loss_per_sample = token_loss_per_token.view(B, -1).mean(dim=1)
+            
+            # Scalar for backward
+            token_loss = token_loss_per_sample.mean()
+            
             loss = token_loss
             aux['token_loss'] = token_loss.detach()
+            aux['token_loss_per_sample'] = token_loss_per_sample.detach()  # For trust-weighted Dyna
         
         # Reward/done predictions (if training or explicitly requested)
         if target_rewards is not None or target_dones is not None or compute_reward_done:
