@@ -28,8 +28,100 @@ from dataclasses import dataclass, asdict, field
 from typing import Optional, Tuple, List, Dict
 from tqdm import tqdm
 
+# Limit OpenCV threads to prevent CPU thrashing (must be before cv2 import)
+import cv2
+cv2.setNumThreads(1)
+cv2.ocl.setUseOpenCL(False)
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
+
+# Compute checkpoint root relative to this script (world_model/v2/train/train_policy.py)
+# Checkpoints go to: world_model/checkpoints/v2/{game}
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORLD_MODEL_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))  # world_model/
+CHECKPOINTS_ROOT = os.path.join(_WORLD_MODEL_ROOT, "checkpoints", "v2")
+
+
+def resolve_policy_resume_path(
+    from_run: str = None, 
+    from_checkpoint: str = None,
+    base_dir: str = None,
+) -> tuple:
+    """
+    Resolve policy and world model checkpoint paths for resuming training.
+    
+    Args:
+        from_run: Run directory name (e.g., "20260113_004626") or "latest"
+        from_checkpoint: Checkpoint name: "latest", "best", or "epochXX"
+        base_dir: Base checkpoint directory (default: CHECKPOINTS_ROOT/mspacman)
+        
+    Returns:
+        (policy_path, wm_path) tuple, or (None, None) if from_run not specified
+    """
+    import glob
+    import re
+    
+    if not from_run:
+        return None, None
+    
+    if base_dir is None:
+        base_dir = os.path.join(CHECKPOINTS_ROOT, "mspacman")
+    
+    runs_dir = os.path.join(base_dir, "policy_runs")
+    
+    # Find run directory
+    if from_run == "latest":
+        if not os.path.exists(runs_dir):
+            raise FileNotFoundError(f"Runs directory not found: {runs_dir}")
+        run_dirs = [d for d in os.listdir(runs_dir) if os.path.isdir(os.path.join(runs_dir, d))]
+        if not run_dirs:
+            raise FileNotFoundError(f"No run directories found in: {runs_dir}")
+        run_dirs.sort(reverse=True)  # Timestamp format sorts correctly
+        run_name = run_dirs[0]
+        print(f"  Using latest run: {run_name}")
+    else:
+        run_name = from_run
+    
+    run_path = os.path.join(runs_dir, run_name)
+    if not os.path.exists(run_path):
+        raise FileNotFoundError(f"Run directory not found: {run_path}")
+    
+    # Resolve checkpoint name
+    checkpoint_name = from_checkpoint or "latest"
+    
+    if checkpoint_name == "best":
+        policy_path = os.path.join(run_path, "policy_best.pt")
+        wm_path = os.path.join(run_path, "world_model_finetuned_best.pt")
+    elif checkpoint_name == "latest" or checkpoint_name == "final":
+        # Try final first, then best
+        policy_path = os.path.join(run_path, "policy_final.pt")
+        if not os.path.exists(policy_path):
+            policy_path = os.path.join(run_path, "policy_best.pt")
+        wm_path = os.path.join(run_path, "world_model_final.pt")
+        if not os.path.exists(wm_path):
+            wm_path = os.path.join(run_path, "world_model_finetuned_best.pt")
+    elif checkpoint_name.startswith("epoch"):
+        # Extract epoch number: epoch20 -> 20
+        epoch_match = re.match(r'epoch(\d+)', checkpoint_name)
+        if not epoch_match:
+            raise ValueError(f"Invalid checkpoint format: {checkpoint_name}. Use 'best', 'latest', or 'epochXX'")
+        epoch_num = epoch_match.group(1)
+        policy_path = os.path.join(run_path, f"policy_epoch{epoch_num}.pt")
+        wm_path = os.path.join(run_path, f"world_model_epoch{epoch_num}.pt")
+    else:
+        raise ValueError(f"Invalid checkpoint: {checkpoint_name}. Use 'best', 'latest', or 'epochXX'")
+    
+    # Validate policy exists
+    if not os.path.exists(policy_path):
+        raise FileNotFoundError(f"Policy checkpoint not found: {policy_path}")
+    
+    # WM is optional (might not have fine-tuned WM)
+    if not os.path.exists(wm_path):
+        wm_path = None
+    
+    return policy_path, wm_path
+
 
 from models.vqvae_hires import VQVAEHiRes
 from models.temporal_world_model import TemporalVisualWorldModel
@@ -53,22 +145,22 @@ class DynaConfig:
     game: str = "ALE/MsPacman-v5"
     frame_skip: int = 4
     max_episode_steps: int = 10000
-    n_envs: int = 2                   # Reduced to 2 - CPU bottleneck from Atari emulation
+    n_envs: int = 6                   # Reduced for memory (was 8)
     
     # Training - epoch based
     n_epochs: int = 50                # Increased for longer training
-    steps_per_epoch: int = 5000       # Increased for more steps per epoch
+    steps_per_epoch: int = 500       # Increased for more steps per epoch
     train_freq: int = 4               # Train every N environment steps
-    batch_size: int = 256             # Reduced to lower CPU pressure
-    gradient_steps: int = 2           # Reduced from 4 to 2 - less GPU work per step
-    warmup_steps: int = 5000          # Increased warmup for more initial data
+    batch_size: int = 1024             # Reduced for memory (was 256)
+    gradient_steps: int = 2           # Single step to reduce memory
+    warmup_steps: int = 1000          # Reduced warmup (4 envs now)
     grad_clip: float = 10.0           # Gradient clipping for DQN stability
     
     # Dyna-specific (WM → Policy)
     imagined_rollout_len: int = 3     # K steps of imagination (start short)
     imagined_ratio: float = 0.05      # Fraction of imagined data (5% to start)
-    imagined_update_freq: int = 100   # Less frequent imagination to reduce load
-    imagined_batch_size: int = 32     # Reduced to lower CPU/GPU pressure
+    imagined_update_freq: int = 200   # Less frequent to reduce overhead
+    imagined_batch_size: int = 64     # Larger batch for efficiency
     imagined_buffer_ttl: int = 0      # 0 = disabled, use ring buffer (no hard clears)
     
     # Adaptive imagination (based on WM quality)
@@ -80,11 +172,11 @@ class DynaConfig:
         (0.4, 0.15),   # WM loss < 0.4 → 15% imagined
     )
     
-    # Bidirectional: WM fine-tuning (Policy → WM)
+    # Bidirectional: WM fine-tuning (Policy -> WM)
     wm_finetune: bool = True          # Enable WM fine-tuning for proper Dyna loop
-    wm_update_freq: int = 100         # Less frequent WM updates to reduce load
+    wm_update_freq: int = 200         # WM update frequency
     wm_updates_per_step: int = 1      # Number of WM gradient steps each time
-    wm_batch_size: int = 16           # Small batch
+    wm_batch_size: int = 32           # Larger batch for efficiency
     wm_lr: float = 1e-5               # Lower LR than initial WM training
     wm_grad_clip: float = 1.0         # Gradient clipping for WM
     wm_recent_k: int = 50000          # Recency window for WM sampling
@@ -96,12 +188,12 @@ class DynaConfig:
     priority_beta_start: float = 0.4  # IS correction, anneals to 1.0
     priority_beta_increment: float = 0.001  # Beta annealing rate
     
-    # Buffers - reduced to save CPU RAM
-    real_buffer_size: int = 100000    # Reduced from 200k
-    imagined_buffer_size: int = 50000 # Reduced from 100k
+    # Buffers
+    real_buffer_size: int = 100000    # 100k transitions
+    imagined_buffer_size: int = 50000 # 50k imagined transitions
     
-    # Evaluation
-    eval_episodes: int = 20           # Increased for stable eval estimates
+    # Evaluation - reduced since stochastic env provides variance
+    eval_episodes: int = 10           # More episodes for stable eval metrics
     eval_random_noops: int = 30       # Random no-ops at eval reset for stochasticity
     
     # DQN hyperparameters
@@ -109,7 +201,7 @@ class DynaConfig:
     gamma: float = 0.99
     epsilon_start: float = 1.0
     epsilon_end: float = 0.05
-    epsilon_decay_epochs: int = 20    # Slower decay over more epochs
+    epsilon_decay_epochs: int = 40    # Slower decay (was 20) for more exploration
     target_update_freq: int = 1000    # Steps between target network updates
 
 
@@ -160,12 +252,14 @@ class AtariEnvWrapper:
         target_size: Tuple[int, int] = (84, 64),
         max_episode_steps: int = 10000,
         random_noops: int = 0,  # Max random no-ops at reset for eval stochasticity
+        stochastic: bool = False,  # Use stochastic action repeat (0.25) for evaluation
     ):
         self.vqvae = vqvae
         self.device = device
         self.history_len = history_len
         self.target_size = target_size
         self.random_noops = random_noops
+        self.stochastic = stochastic
         
         # Get token dimensions from VQ-VAE
         with torch.no_grad():
@@ -175,10 +269,13 @@ class AtariEnvWrapper:
             self.n_tokens = self.token_h * self.token_w
         
         # Create environment
+        # Use stochastic=True for evaluation to get variance in episode outcomes
+        # Keep deterministic (0.0) for training to reduce learning variance
+        repeat_action_prob = 0.25 if stochastic else 0.0
         self.env = gym.make(
             game,
             frameskip=frame_skip,
-            repeat_action_probability=0.0,
+            repeat_action_probability=repeat_action_prob,
             render_mode=None,
             max_episode_steps=max_episode_steps,
         )
@@ -313,6 +410,9 @@ class VectorizedAtariEnv:
         
         # Completed episode tracking
         self.completed_episodes = []
+        
+        # Life tracking for life loss penalty
+        self.prev_lives = [None] * n_envs
     
     def reset(self) -> torch.Tensor:
         """Reset all environments and return initial states."""
@@ -330,6 +430,9 @@ class VectorizedAtariEnv:
         self.episode_rewards = np.zeros(self.n_envs)
         self.episode_lengths = np.zeros(self.n_envs, dtype=np.int32)
         self.completed_episodes = []
+        
+        # Initialize lives tracking
+        self.prev_lives = [None] * self.n_envs
         
         return self.token_histories.clone().cpu()  # (n_envs, history_len, n_tokens) on CPU for replay
     
@@ -359,6 +462,13 @@ class VectorizedAtariEnv:
             rewards[i] = reward
             dones[i] = done
             
+            # Life loss penalty: -1 reward when losing a life (but not game over)
+            current_lives = info.get('lives', None)
+            if current_lives is not None and self.prev_lives[i] is not None:
+                if current_lives < self.prev_lives[i] and not done:
+                    rewards[i] -= 1.0  # Life loss penalty
+            self.prev_lives[i] = current_lives
+            
             self.episode_rewards[i] += reward
             self.episode_lengths[i] += 1
             
@@ -376,6 +486,7 @@ class VectorizedAtariEnv:
                 frames[-1] = self._preprocess_single(obs)
                 self.episode_rewards[i] = 0
                 self.episode_lengths[i] = 0
+                self.prev_lives[i] = None  # Reset lives tracking for new episode
             
             infos.append(info)
         
@@ -571,6 +682,16 @@ def wm_update_step(
     return wm_loss.item()
 
 
+def compute_ema(values: list, alpha: float = 0.3) -> list:
+    """Compute exponential moving average of a list of values."""
+    if not values:
+        return []
+    ema = [values[0]]
+    for v in values[1:]:
+        ema.append(alpha * v + (1 - alpha) * ema[-1])
+    return ema
+
+
 def plot_training_progress(stats: TrainingStats, save_path: str):
     """Generate training progress plots."""
     fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -587,14 +708,20 @@ def plot_training_progress(stats: TrainingStats, save_path: str):
     # 2. Episode Rewards
     ax = axes[0, 1]
     if stats.episode_reward:
-        ax.plot(stats.step, stats.episode_reward, 'g-', alpha=0.7, label='Train')
+        ax.plot(stats.step, stats.episode_reward, 'g-', alpha=0.4, label='Train')
         if stats.eval_reward_mean:
             eval_steps = [stats.step[i] for i in range(len(stats.step)) 
                          if i < len(stats.eval_reward_mean) and stats.eval_reward_mean[i] is not None]
             eval_rewards = [r for r in stats.eval_reward_mean if r is not None]
             if eval_steps and eval_rewards and len(eval_steps) == len(eval_rewards):
-                ax.plot(eval_steps[:len(eval_rewards)], eval_rewards, 'r-o', 
-                       linewidth=2, markersize=8, label='Eval')
+                # Plot raw eval points
+                ax.plot(eval_steps[:len(eval_rewards)], eval_rewards, 'ro', 
+                       markersize=6, alpha=0.5, label='Eval')
+                # Plot EMA trend line
+                if len(eval_rewards) >= 2:
+                    eval_ema = compute_ema(eval_rewards, alpha=0.3)
+                    ax.plot(eval_steps[:len(eval_ema)], eval_ema, 'r-', 
+                           linewidth=2.5, label='Eval EMA')
         ax.set_xlabel('Step')
         ax.set_ylabel('Reward')
         ax.set_title('Episode Rewards')
@@ -712,15 +839,21 @@ def evaluate_policy(
 
 
 def train_dyna(
-    base_dir: str = "checkpoints/v2/mspacman",
+    base_dir: str = None,
     config: Optional[DynaConfig] = None,
     device: str = None,
     resume_policy: str = None,
     resume_wm: str = None,
     epsilon_override: float = None,
+    vqvae_path: str = None,
+    wm_path: str = None,
 ):
     """Main Dyna-style training loop with epochs."""
     config = config or DynaConfig()
+    
+    # Use canonical checkpoint directory (relative to this script)
+    if base_dir is None:
+        base_dir = os.path.join(CHECKPOINTS_ROOT, "mspacman")
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     
     print("=" * 60)
@@ -749,7 +882,8 @@ def train_dyna(
     
     # Load VQ-VAE
     print("\nLoading VQ-VAE...")
-    vqvae_path = f"{base_dir}/vqvae_hires.pt"
+    if vqvae_path is None:
+        vqvae_path = f"{base_dir}/vqvae_hires.pt"
     vqvae_ckpt = torch.load(vqvae_path, map_location=device, weights_only=False)
     vqvae = VQVAEHiRes(
         in_channels=3,
@@ -762,23 +896,52 @@ def train_dyna(
     
     # Load world model
     print("\nLoading World Model...")
-    wm_path = f"{base_dir}/world_model_best.pt"
+    # Prioritize resume_wm if wm_path not provided
+    if wm_path is None and resume_wm is not None:
+        wm_path = resume_wm
+        resume_wm = None  # Don't load twice
+    elif wm_path is None:
+        wm_path = f"{base_dir}/world_model_best.pt"
+    
     wm_ckpt = torch.load(wm_path, map_location=device, weights_only=False)
     
+    # Handle both full checkpoint format and state_dict only format
+    if 'model_state_dict' in wm_ckpt:
+        # Full checkpoint format
+        state_dict = wm_ckpt['model_state_dict']
+        n_vocab = wm_ckpt['n_vocab']
+        n_actions = wm_ckpt['n_actions']
+        n_layers = wm_ckpt.get('n_layers', 10)
+        token_h = wm_ckpt['token_h']
+        token_w = wm_ckpt['token_w']
+    else:
+        # State dict only format - infer architecture from weights
+        state_dict = wm_ckpt
+        n_actions = state_dict['action_embed.weight'].shape[0]
+        n_vocab = state_dict['token_embed.weight'].shape[0]
+        n_layers = sum(1 for k in state_dict.keys() if k.startswith('transformer.') and k.endswith('.self_attn.in_proj_weight'))
+        # Infer token grid from spatial position embeddings
+        if 'spatial_pos.row_embed.weight' in state_dict:
+            token_h = state_dict['spatial_pos.row_embed.weight'].shape[0]
+            token_w = state_dict['spatial_pos.col_embed.weight'].shape[0]
+        else:
+            token_h, token_w = 21, 16  # Default hi-res grid
+        print(f"  (Inferred from state_dict: {n_actions} actions, {n_vocab} vocab, {n_layers} layers, {token_h}x{token_w})")
+    
     world_model = TemporalVisualWorldModel(
-        n_vocab=wm_ckpt['n_vocab'],
-        n_actions=wm_ckpt['n_actions'],
+        n_vocab=n_vocab,
+        n_actions=n_actions,
         d_model=256,
         n_heads=8,
-        n_layers=wm_ckpt.get('n_layers', 10),
-        token_h=wm_ckpt['token_h'],
-        token_w=wm_ckpt['token_w'],
+        n_layers=n_layers,
+        token_h=token_h,
+        token_w=token_w,
         max_history=4,
     ).to(device)
-    world_model.load_state_dict(wm_ckpt['model_state_dict'])
-    print(f"  Loaded base WM from {wm_path}")
+    world_model.load_state_dict(state_dict)
+    print(f"  Loaded WM from {wm_path}")
     
-    # Optionally load fine-tuned WM checkpoint
+    # Optionally load fine-tuned WM checkpoint on top
     if resume_wm:
         print(f"  Loading fine-tuned WM from {resume_wm}...")
         wm_finetune_state = torch.load(resume_wm, map_location=device, weights_only=True)
@@ -787,8 +950,7 @@ def train_dyna(
     
     world_model.eval()
     
-    n_actions = wm_ckpt['n_actions']
-    n_tokens = wm_ckpt['token_h'] * wm_ckpt['token_w']
+    n_tokens = token_h * token_w
     
     # Create vectorized environment (parallel envs for more GPU usage)
     print("\nCreating vectorized environment...")
@@ -805,7 +967,7 @@ def train_dyna(
     print(f"  Actions: {n_actions}")
     print(f"  Token grid: {vec_env.token_h}x{vec_env.token_w} = {n_tokens}")
     
-    # Single env for evaluation (with random no-ops for stochasticity)
+    # Single env for evaluation (with stochastic action repeat + random no-ops)
     eval_env = AtariEnvWrapper(
         game=config.game,
         vqvae=vqvae,
@@ -814,6 +976,7 @@ def train_dyna(
         history_len=4,
         max_episode_steps=config.max_episode_steps,
         random_noops=config.eval_random_noops,
+        stochastic=True,  # Use repeat_action_probability=0.25 for realistic eval variance
     )
     
     # Calculate epsilon decay
@@ -835,7 +998,7 @@ def train_dyna(
         epsilon_decay_steps=decay_steps,
     )
     agent = DQNAgent(
-        n_vocab=wm_ckpt['n_vocab'],
+        n_vocab=n_vocab,
         n_actions=n_actions,
         history_len=4,
         n_tokens=n_tokens,
@@ -854,7 +1017,7 @@ def train_dyna(
     if epsilon_override is not None:
         old_eps = agent.epsilon
         agent.epsilon = epsilon_override
-        print(f"  Epsilon overridden: {old_eps:.3f} → {epsilon_override:.3f}")
+        print(f"  Epsilon overridden: {old_eps:.3f} -> {epsilon_override:.3f}")
     
     # Create buffers - use PrioritizedReplayBuffer for bidirectional training
     if config.use_prioritized:
@@ -1111,7 +1274,7 @@ def train_dyna(
                 if avg_wm_loss < threshold:
                     current_imagined_ratio = ratio
             if current_imagined_ratio != old_ratio:
-                print(f"    Adaptive ratio: {old_ratio*100:.1f}% → {current_imagined_ratio*100:.1f}% (WM loss={avg_wm_loss:.4f})")
+                print(f"    Adaptive ratio: {old_ratio*100:.1f}% -> {current_imagined_ratio*100:.1f}% (WM loss={avg_wm_loss:.4f})")
         
         # Print epoch summary
         print(f"\n  Epoch {epoch} Summary:")
@@ -1127,35 +1290,38 @@ def train_dyna(
         print(f"    Buffer: {len(real_buffer):,} real, {len(imagined_buffer):,} imagined")
         print(f"    Time: {epoch_time:.1f}s")
         
-        # Save checkpoint
+        # Save checkpoint (with error handling for disk issues)
         is_best = eval_mean > best_eval_reward
-        if is_best:
-            best_eval_reward = eval_mean
-            agent.save(f"{run_dir}/policy_best.pt")
-            print(f"    New best! Saved to policy_best.pt")
-        
-        agent.save(f"{run_dir}/policy_epoch{epoch}.pt")
-        
-        # Save World Model if fine-tuning is enabled
-        if config.wm_finetune:
-            torch.save(world_model.state_dict(), f"{run_dir}/world_model_epoch{epoch}.pt")
-            # Track best WM loss
-            if not hasattr(train_dyna, 'best_wm_loss'):
-                train_dyna.best_wm_loss = float('inf')
-            avg_wm_loss = np.mean(wm_losses[-100:]) if wm_losses else float('inf')
-            if avg_wm_loss < train_dyna.best_wm_loss:
-                train_dyna.best_wm_loss = avg_wm_loss
-                torch.save(world_model.state_dict(), f"{run_dir}/world_model_finetuned_best.pt")
-                print(f"    New best WM! Loss: {avg_wm_loss:.4f}")
+        try:
+            if is_best:
+                best_eval_reward = eval_mean
+                agent.save(f"{run_dir}/policy_best.pt")
+                print(f"    New best! Saved to policy_best.pt")
+            
+            # Save World Model if fine-tuning is enabled (only best, skip epoch saves to save space)
+            if config.wm_finetune:
+                # Track best WM loss
+                if not hasattr(train_dyna, 'best_wm_loss'):
+                    train_dyna.best_wm_loss = float('inf')
+                avg_wm_loss = np.mean(wm_losses[-100:]) if wm_losses else float('inf')
+                if avg_wm_loss < train_dyna.best_wm_loss:
+                    train_dyna.best_wm_loss = avg_wm_loss
+                    torch.save(world_model.state_dict(), f"{run_dir}/world_model_finetuned_best.pt")
+                    print(f"    New best WM! Loss: {avg_wm_loss:.4f}")
+        except (RuntimeError, OSError) as e:
+            print(f"    WARNING: Save failed (disk full?): {e}")
         
         # Update plots and stats
         plot_training_progress(stats, f"{run_dir}/training_progress.png")
         save_training_stats(stats, f"{run_dir}/training_stats.txt")
     
-    # Final save
-    agent.save(f"{run_dir}/policy_final.pt")
-    if config.wm_finetune:
-        torch.save(world_model.state_dict(), f"{run_dir}/world_model_final.pt")
+    # Final save (with error handling)
+    try:
+        agent.save(f"{run_dir}/policy_final.pt")
+        if config.wm_finetune:
+            torch.save(world_model.state_dict(), f"{run_dir}/world_model_final.pt")
+    except (RuntimeError, OSError) as e:
+        print(f"WARNING: Final save failed: {e}")
     vec_env.close()
     eval_env.close()
     
@@ -1172,36 +1338,109 @@ def train_dyna(
 if __name__ == "__main__":
     import argparse
     
-    parser = argparse.ArgumentParser(description="Dyna-style policy training")
-    parser.add_argument("--base_dir", type=str, default="checkpoints/v2/mspacman",
-                        help="Directory with VQ-VAE and world model")
-    parser.add_argument("--epochs", type=int, default=50,
-                        help="Number of training epochs")
-    parser.add_argument("--steps_per_epoch", type=int, default=5000,
-                        help="Environment steps per epoch")
-    parser.add_argument("--batch_size", type=int, default=256,
-                        help="Batch size for training")
+    parser = argparse.ArgumentParser(
+        description="Dyna-style policy training",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Fresh training (no resume):
+  python train_policy.py --vqvae path/to/vqvae.pt --wm path/to/world_model.pt
+
+  # Resume from latest run, latest checkpoint:
+  python train_policy.py --run latest
+
+  # Resume from specific run, best checkpoint:
+  python train_policy.py --run 20260113_004626 --checkpoint best
+
+  # Resume from specific run, specific epoch:
+  python train_policy.py --run 20260113_004626 --checkpoint epoch50
+
+  # Resume with explicit paths (legacy):
+  python train_policy.py --resume_policy path/to/policy.pt --resume_wm path/to/wm.pt
+        """
+    )
+    parser.add_argument("--base_dir", type=str, default=None,
+                        help="Directory with VQ-VAE and world model (default: world_model/checkpoints/v2/mspacman)")
+    
+    # Resume from run directory (new system)
+    parser.add_argument("--run", type=str, default=None,
+                        help="Run to resume from: timestamp (e.g., '20260113_004626') or 'latest'")
+    parser.add_argument("--checkpoint", type=str, default=None,
+                        help="Checkpoint within run: 'latest', 'best', or 'epochXX' (default: latest)")
+    
+    # Training parameters
+    parser.add_argument("--epochs", type=int, default=None,
+                        help="Number of training epochs (default: from DynaConfig)")
+    parser.add_argument("--steps_per_epoch", type=int, default=None,
+                        help="Environment steps per epoch (default: from DynaConfig)")
+    parser.add_argument("--batch_size", type=int, default=None,
+                        help="Batch size for training (default: from DynaConfig)")
     parser.add_argument("--device", type=str, default=None,
                         help="Device (cuda/cpu)")
+    
+    # Legacy resume (explicit paths)
     parser.add_argument("--resume_policy", type=str, default=None,
-                        help="Path to policy checkpoint to resume from")
+                        help="[Legacy] Explicit path to policy checkpoint")
     parser.add_argument("--resume_wm", type=str, default=None,
-                        help="Path to fine-tuned WM checkpoint (optional)")
+                        help="[Legacy] Explicit path to fine-tuned WM checkpoint")
+    
     parser.add_argument("--epsilon", type=float, default=None,
                         help="Override epsilon value (e.g., 0.5 for more exploration)")
+    parser.add_argument("--no-imagination", action="store_true",
+                        help="Disable imagination (pure real experience, no world model rollouts)")
+    parser.add_argument("--no-wm-finetune", action="store_true",
+                        help="Disable world model fine-tuning")
+    parser.add_argument("--vqvae", type=str, default=None,
+                        help="Path to VQ-VAE checkpoint (default: base_dir/vqvae_hires.pt)")
+    parser.add_argument("--wm", type=str, default=None,
+                        help="Path to base world model checkpoint (default: base_dir/world_model_best.pt)")
     
     args = parser.parse_args()
     
-    config = DynaConfig(
-        n_epochs=args.epochs,
-        steps_per_epoch=args.steps_per_epoch,
-        batch_size=args.batch_size,
-    )
+    # Resolve run/checkpoint to paths (new system takes precedence)
+    resume_policy = args.resume_policy
+    resume_wm = args.resume_wm
+    
+    if args.run:
+        print(f"Resolving checkpoint from run: {args.run}, checkpoint: {args.checkpoint or 'latest'}")
+        policy_path, wm_path = resolve_policy_resume_path(
+            from_run=args.run,
+            from_checkpoint=args.checkpoint,
+            base_dir=args.base_dir,
+        )
+        resume_policy = policy_path
+        if wm_path:
+            resume_wm = wm_path
+        print(f"  Policy: {resume_policy}")
+        print(f"  WM: {resume_wm or '(none)'}")
+    
+    # Start with defaults from DynaConfig, only override if explicitly provided
+    config = DynaConfig()
+    if args.epochs is not None:
+        config.n_epochs = args.epochs
+    if args.steps_per_epoch is not None:
+        config.steps_per_epoch = args.steps_per_epoch
+    if args.batch_size is not None:
+        config.batch_size = args.batch_size
+    
+    # Disable imagination if requested
+    if getattr(args, 'no_imagination', False):
+        config.imagined_ratio = 0.0
+        config.adaptive_imagined_ratio = False
+        print("Imagination DISABLED (pure real experience)")
+    
+    # Disable WM fine-tuning if requested  
+    if getattr(args, 'no_wm_finetune', False):
+        config.wm_finetune = False
+        print("World model fine-tuning DISABLED")
+    
     train_dyna(
         base_dir=args.base_dir, 
         config=config, 
         device=args.device,
-        resume_policy=args.resume_policy,
-        resume_wm=args.resume_wm,
+        resume_policy=resume_policy,
+        resume_wm=resume_wm,
         epsilon_override=args.epsilon,
+        vqvae_path=args.vqvae,
+        wm_path=args.wm,
     )

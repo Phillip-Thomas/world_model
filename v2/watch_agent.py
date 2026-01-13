@@ -6,6 +6,7 @@ Visualize the DQN agent playing Atari games.
 Usage:
     python watch_agent.py --game mspacman
     python watch_agent.py --game mspacman --policy checkpoints/v2/mspacman/policy_runs/xxx/policy_best.pt
+    python watch_agent.py --game mspacman --vqvae path/to/vqvae.pt --policy path/to/policy.pt
 """
 
 import os
@@ -23,6 +24,12 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Compute checkpoint root relative to this script (world_model/v2/watch_agent.py)
+# Checkpoints are at: world_model/checkpoints/v2/{game}
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORLD_MODEL_ROOT = os.path.dirname(_SCRIPT_DIR)  # world_model/
+CHECKPOINTS_ROOT = os.path.join(_WORLD_MODEL_ROOT, "checkpoints", "v2")
+
 try:
     import gymnasium as gym
     import ale_py
@@ -38,12 +45,12 @@ from agents.dqn_agent import DQNAgent
 GAME_CONFIGS = {
     "breakout": {
         "env_name": "ALE/Breakout-v5",
-        "base_dir": "checkpoints/v2/atari",
+        "base_dir": os.path.join(CHECKPOINTS_ROOT, "atari"),
         "n_actions": 4,
     },
     "mspacman": {
         "env_name": "ALE/MsPacman-v5",
-        "base_dir": "checkpoints/v2/mspacman",
+        "base_dir": os.path.join(CHECKPOINTS_ROOT, "mspacman"),
         "n_actions": 9,
     },
 }
@@ -104,6 +111,7 @@ class AgentVisualizer:
         self,
         game: str,
         policy_path: str = None,
+        vqvae_path: str = None,
         device: str = None,
         history_len: int = 4,
     ):
@@ -114,7 +122,8 @@ class AgentVisualizer:
         
         # Load VQ-VAE
         print("Loading VQ-VAE...")
-        vqvae_path = os.path.join(self.config["base_dir"], "vqvae_hires.pt")
+        if vqvae_path is None:
+            vqvae_path = os.path.join(self.config["base_dir"], "vqvae_hires.pt")
         checkpoint = torch.load(vqvae_path, map_location=self.device, weights_only=True)
         
         # Infer n_embeddings from checkpoint
@@ -322,6 +331,8 @@ def main():
                         help="Game to play")
     parser.add_argument("--policy", type=str, default=None,
                         help="Path to policy checkpoint (default: latest)")
+    parser.add_argument("--vqvae", type=str, default=None,
+                        help="Path to VQ-VAE checkpoint (default: base_dir/vqvae_hires.pt)")
     parser.add_argument("--episodes", type=int, default=3,
                         help="Number of episodes to run")
     parser.add_argument("--delay", type=float, default=0.02,
@@ -341,6 +352,7 @@ def main():
     viz = AgentVisualizer(
         game=args.game,
         policy_path=args.policy,
+        vqvae_path=args.vqvae,
         device=args.device,
     )
     

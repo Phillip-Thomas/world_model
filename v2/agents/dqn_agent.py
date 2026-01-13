@@ -381,9 +381,8 @@ class DQNAgent:
         batch = batch.to(self.device)
         cfg = self.config
         
-        # Game-agnostic reward normalization using running statistics
-        self.reward_normalizer.update(batch.rewards)
-        rewards = self.reward_normalizer.normalize(batch.rewards)
+        # Standard Atari DQN reward clipping: sign(reward) -> {-1, 0, +1}
+        rewards = torch.sign(batch.rewards)
         
         # Current Q-values: Q(s, a)
         q_values = self.policy_net(batch.states)  # (B, n_actions)
@@ -452,9 +451,8 @@ class DQNAgent:
         weights = weights.to(self.device)
         cfg = self.config
         
-        # Game-agnostic reward normalization
-        self.reward_normalizer.update(batch.rewards)
-        rewards = self.reward_normalizer.normalize(batch.rewards)
+        # Standard Atari DQN reward clipping: sign(reward) -> {-1, 0, +1}
+        rewards = torch.sign(batch.rewards)
         
         # Current Q-values
         q_values = self.policy_net(batch.states)

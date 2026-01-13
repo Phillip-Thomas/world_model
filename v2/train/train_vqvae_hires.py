@@ -37,6 +37,12 @@ import matplotlib.pyplot as plt
 from models.vqvae_hires import VQVAEHiRes
 from config.defaults import VQVAEConfig
 
+# Compute checkpoint root relative to this script (world_model/v2/train/train_vqvae_hires.py)
+# Checkpoints go to: world_model/checkpoints/v2/{game}
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORLD_MODEL_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))  # world_model/
+CHECKPOINTS_ROOT = os.path.join(_WORLD_MODEL_ROOT, "checkpoints", "v2")
+
 
 # =============================================================================
 # Run Directory Management
@@ -217,8 +223,8 @@ def episode_based_split(episode_starts: np.ndarray, total_frames: int, val_ratio
 
 
 def train_vqvae_hires(
-    data_path: str = "checkpoints/v2/atari/atari_game_data.npz",
-    base_dir: str = "checkpoints/v2/atari",
+    data_path: str = None,
+    base_dir: str = None,
     n_epochs: int = 25,
     batch_size: int = 128,
     learning_rate: float = 3e-4,
@@ -248,8 +254,11 @@ def train_vqvae_hires(
     - Compute detailed stats every 500 batches (not 50)
     - GPU-only validation histogram
     """
-    # Change to project root for consistent paths
-    os.chdir(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    # Use canonical checkpoint directory (relative to this script)
+    if base_dir is None:
+        base_dir = os.path.join(CHECKPOINTS_ROOT, "atari")
+    if data_path is None:
+        data_path = os.path.join(base_dir, "atari_game_data.npz")
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
@@ -816,10 +825,10 @@ if __name__ == "__main__":
     )
     
     # Data and output paths
-    parser.add_argument("--data", type=str, default="checkpoints/v2/atari/atari_game_data.npz",
-                        help="Path to game data file")
-    parser.add_argument("--base-dir", type=str, default="checkpoints/v2/atari",
-                        help="Base directory for shared assets")
+    parser.add_argument("--data", type=str, default=None,
+                        help="Path to game data file (default: base_dir/atari_game_data.npz)")
+    parser.add_argument("--base-dir", type=str, default=None,
+                        help="Base directory for shared assets (default: world_model/checkpoints/v2/atari)")
     
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=None, help="Number of epochs")

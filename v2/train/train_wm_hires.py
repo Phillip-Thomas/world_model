@@ -47,6 +47,12 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+# Compute checkpoint root relative to this script (world_model/v2/train/train_wm_hires.py)
+# Checkpoints go to: world_model/checkpoints/v2/{game}
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORLD_MODEL_ROOT = os.path.dirname(os.path.dirname(_SCRIPT_DIR))  # world_model/
+CHECKPOINTS_ROOT = os.path.join(_WORLD_MODEL_ROOT, "checkpoints", "v2")
+
 from models.vqvae_hires import VQVAEHiRes
 from models.temporal_world_model import TemporalVisualWorldModel
 from data.atari_dataset import AtariTemporalDataset
@@ -210,7 +216,7 @@ def multistep_rollout_loss(
 
 
 # Default runs directory (can be overridden by base_dir parameter)
-DEFAULT_RUNS_DIR = "checkpoints/v2/atari/runs"
+DEFAULT_RUNS_DIR = os.path.join(CHECKPOINTS_ROOT, "atari", "runs")
 
 
 def resolve_resume_path(from_run: str = None, from_checkpoint: str = None, 
@@ -292,7 +298,7 @@ def resolve_resume_path(from_run: str = None, from_checkpoint: str = None,
 
 
 def train_world_model_hires(
-    base_dir: str = "checkpoints/v2/atari",  # Game-specific base directory
+    base_dir: str = None,  # Game-specific base directory
     n_epochs: int = 30,
     batch_size: int = 8,  # Reduced for K=5 rollouts
     learning_rate: float = 5e-4,  # Increased from 3e-4 to shake things up
@@ -320,7 +326,9 @@ def train_world_model_hires(
     max_weight: float = 8.0,
 ):
     """Train world model with high-res tokenization and multi-step rollouts."""
-    os.chdir(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+    # Use canonical checkpoint directory (relative to this script)
+    if base_dir is None:
+        base_dir = os.path.join(CHECKPOINTS_ROOT, "atari")
     
     # Ensure base_dir exists
     os.makedirs(base_dir, exist_ok=True)
@@ -1324,8 +1332,8 @@ if __name__ == "__main__":
     )
     
     # Game-specific directory
-    parser.add_argument('--base-dir', type=str, default="checkpoints/v2/atari",
-                        help='Base directory for game data (e.g., checkpoints/v2/mspacman)')
+    parser.add_argument('--base-dir', type=str, default=None,
+                        help='Base directory for game data (default: world_model/checkpoints/v2/atari)')
     
     # All args use None as default so we can detect explicit overrides
     parser.add_argument('--epochs', type=int, default=None, help='Number of epochs')

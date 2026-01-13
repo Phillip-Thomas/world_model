@@ -199,6 +199,93 @@ class ReplayBuffer:
         return self.size >= min_size
 
 
+class SumTree:
+    """
+    Sum Tree data structure for O(log n) prioritized sampling.
+    
+    A binary tree where:
+    - Leaf nodes store priorities of transitions
+    - Internal nodes store sum of children's priorities
+    - Root stores total priority sum
+    
+    Operations:
+    - update(idx, priority): O(log n)
+    - sample(value): O(log n) - find leaf where cumsum reaches value
+    - total(): O(1) - get total priority sum
+    """
+    
+    def __init__(self, capacity: int):
+        self.capacity = capacity
+        # Tree has capacity leaves and capacity-1 internal nodes
+        # We use 2*capacity for simplicity (some space wasted but cleaner indexing)
+        self.tree = np.zeros(2 * capacity, dtype=np.float64)
+        self.data_pointer = 0
+    
+    def _propagate(self, idx: int, change: float):
+        """Propagate priority change up the tree."""
+        parent = idx // 2
+        while parent >= 1:
+            self.tree[parent] += change
+            parent //= 2
+    
+    def update(self, data_idx: int, priority: float):
+        """Update priority of a leaf node."""
+        # Leaf nodes start at index capacity
+        tree_idx = data_idx + self.capacity
+        change = priority - self.tree[tree_idx]
+        self.tree[tree_idx] = priority
+        self._propagate(tree_idx, change)
+    
+    def get(self, data_idx: int) -> float:
+        """Get priority of a data index."""
+        return self.tree[data_idx + self.capacity]
+    
+    def sample(self, value: float) -> int:
+        """
+        Find the leaf index where cumulative sum reaches value.
+        Returns data index (0 to capacity-1).
+        """
+        idx = 1  # Start at root
+        while idx < self.capacity:  # While not a leaf
+            left = 2 * idx
+            right = left + 1
+            if value <= self.tree[left]:
+                idx = left
+            else:
+                value -= self.tree[left]
+                idx = right
+        # idx is now a leaf node (>= capacity)
+        return idx - self.capacity
+    
+    def total(self) -> float:
+        """Get total sum of all priorities."""
+        return self.tree[1]  # Root stores total
+    
+    def batch_sample(self, batch_size: int) -> np.ndarray:
+        """
+        Efficiently sample a batch of indices using stratified sampling.
+        Divides total priority into segments and samples one from each.
+        """
+        indices = np.zeros(batch_size, dtype=np.int64)
+        segment = self.total() / batch_size
+        
+        for i in range(batch_size):
+            low = segment * i
+            high = segment * (i + 1)
+            value = np.random.uniform(low, high)
+            indices[i] = self.sample(value)
+        
+        return indices
+    
+    def batch_update(self, data_indices: np.ndarray, priorities: np.ndarray):
+        """
+        Update priorities for multiple indices.
+        Still O(batch_size * log n) but with less Python overhead.
+        """
+        for idx, priority in zip(data_indices, priorities):
+            self.update(idx, priority)
+
+
 class PrioritizedReplayBuffer:
     """
     Prioritized Experience Replay buffer.
@@ -232,8 +319,8 @@ class PrioritizedReplayBuffer:
         self.next_states = torch.zeros(capacity, history_len, n_tokens, dtype=torch.long)
         self.dones = torch.zeros(capacity, dtype=torch.float32)
         
-        # Priority tree (sum tree for efficient sampling)
-        self.priorities = np.zeros(capacity, dtype=np.float32)
+        # SumTree for O(log n) prioritized sampling
+        self.sum_tree = SumTree(capacity)
         self.max_priority = 1.0
         
         self.position = 0
@@ -255,35 +342,38 @@ class PrioritizedReplayBuffer:
         self.next_states[self.position] = next_state.cpu()
         self.dones[self.position] = float(done)
         
-        # Set priority (new transitions get max priority to ensure they're sampled)
-        self.priorities[self.position] = priority if priority else self.max_priority
+        # Set priority in SumTree (new transitions get max priority^alpha)
+        p = (priority if priority else self.max_priority) ** self.alpha
+        self.sum_tree.update(self.position, p)
         
         self.position = (self.position + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
     
     def sample(self, batch_size: int) -> Tuple[TransitionBatch, torch.Tensor, np.ndarray]:
         """
-        Sample a prioritized batch.
+        Sample a prioritized batch using SumTree (O(log n) per sample).
         
         Returns:
             batch: TransitionBatch
             weights: Importance sampling weights (B,)
             indices: Indices of sampled transitions (for priority update)
         """
-        # Compute sampling probabilities
-        priorities = self.priorities[:self.size]
-        probs = priorities ** self.alpha
-        probs /= probs.sum()
+        # Sample indices using SumTree (O(batch_size * log n))
+        indices = self.sum_tree.batch_sample(batch_size)
         
-        # Sample indices
-        indices = np.random.choice(self.size, size=batch_size, p=probs, replace=False)
+        # Get priorities for sampled indices
+        total_priority = self.sum_tree.total()
+        priorities = np.array([self.sum_tree.get(idx) for idx in indices])
         
         # Compute importance sampling weights
-        weights = (self.size * probs[indices]) ** (-self.beta)
-        weights /= weights.max()  # Normalize
+        # P(i) = priority_i / total_priority
+        # weight_i = (N * P(i))^(-beta) = (N * priority_i / total)^(-beta)
+        probs = priorities / total_priority
+        weights = (self.size * probs) ** (-self.beta)
+        weights /= weights.max()  # Normalize to [0, 1]
         weights = torch.from_numpy(weights.astype(np.float32))
         
-        # Anneal beta
+        # Anneal beta toward 1
         self.beta = min(1.0, self.beta + self.beta_increment)
         
         batch = TransitionBatch(
@@ -297,11 +387,12 @@ class PrioritizedReplayBuffer:
         return batch, weights, indices
     
     def update_priorities(self, indices: np.ndarray, td_errors: torch.Tensor):
-        """Update priorities based on TD-errors."""
-        priorities = np.abs(td_errors.cpu().numpy()) + self.epsilon
-        for idx, priority in zip(indices, priorities):
-            self.priorities[idx] = priority
-            self.max_priority = max(self.max_priority, priority)
+        """Update priorities based on TD-errors using SumTree."""
+        priorities = np.abs(td_errors.detach().cpu().numpy()) + self.epsilon
+        self.max_priority = max(self.max_priority, priorities.max())
+        
+        # Update SumTree with new priorities^alpha
+        self.sum_tree.batch_update(indices, priorities ** self.alpha)
     
     def sample_states(self, batch_size: int) -> torch.Tensor:
         """Sample random states (for starting imagined rollouts)."""

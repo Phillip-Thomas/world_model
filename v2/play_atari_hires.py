@@ -34,6 +34,12 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 sys.path.insert(0, os.path.dirname(__file__))
 
+# Compute checkpoint root relative to this script (world_model/v2/play_atari_hires.py)
+# Checkpoints are at: world_model/checkpoints/v2/{game}
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+_WORLD_MODEL_ROOT = os.path.dirname(_SCRIPT_DIR)  # world_model/
+CHECKPOINTS_ROOT = os.path.join(_WORLD_MODEL_ROOT, "checkpoints", "v2")
+
 try:
     import gymnasium as gym
     import ale_py
@@ -55,7 +61,7 @@ from PIL import Image
 GAME_CONFIGS = {
     "breakout": {
         "env_name": "ALE/Breakout-v5",
-        "base_dir": "checkpoints/v2/atari",
+        "base_dir": os.path.join(CHECKPOINTS_ROOT, "atari"),
         "key_to_action": {
             ' ': 1,      # Space = Fire
             'right': 2,  # Right arrow
@@ -65,7 +71,7 @@ GAME_CONFIGS = {
     },
     "mspacman": {
         "env_name": "ALE/MsPacman-v5",
-        "base_dir": "checkpoints/v2/mspacman",
+        "base_dir": os.path.join(CHECKPOINTS_ROOT, "mspacman"),
         "key_to_action": {
             'up': 1,     # Up arrow
             'right': 2,  # Right arrow  
@@ -208,6 +214,7 @@ class AtariWorldPlayerHiRes:
         model_path: str,
         device: str = 'cuda',
         config: WorldModelConfig = None,  # Load from run dir if None
+        vqvae_path: str = None,  # Custom VQ-VAE path (None = auto-detect)
         # CLI overrides (None = use config value)
         deterministic: bool = None,
         temperature: float = None,
@@ -241,8 +248,9 @@ class AtariWorldPlayerHiRes:
         self.game = game_config["env_name"]
         self.history_len = config.model.history_len
         
-        # Resolve VQ-VAE path from base_dir
-        vqvae_path = self._find_vqvae(base_dir)
+        # Resolve VQ-VAE path from base_dir or use provided path
+        if vqvae_path is None:
+            vqvae_path = self._find_vqvae(base_dir)
         
         # Load models
         print("Loading high-res models...")
@@ -333,11 +341,44 @@ class AtariWorldPlayerHiRes:
     def _load_world_model(self, path: str):
         """Load world model with flexible token grid."""
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        n_actions = ckpt['n_actions']  # Must be in checkpoint
-        token_h = ckpt.get('token_h', self.token_h)
-        token_w = ckpt.get('token_w', self.token_w)
-        n_layers = ckpt.get('n_layers', 10)  # v1.2: 10 layers
-        n_vocab = ckpt.get('n_vocab', self.n_embeddings)  # Match VQ-VAE
+        
+        # Handle both formats: full checkpoint (from train_wm) or state_dict only (from train_policy)
+        if 'model_state_dict' in ckpt:
+            # Full checkpoint format
+            state_dict = ckpt['model_state_dict']
+            n_actions = ckpt['n_actions']
+            token_h = ckpt.get('token_h', self.token_h)
+            token_w = ckpt.get('token_w', self.token_w)
+            n_layers = ckpt.get('n_layers', 10)
+            n_vocab = ckpt.get('n_vocab', self.n_embeddings)
+            self.wm_epoch = ckpt.get('epoch', -1) + 1
+            self.wm_acc = ckpt.get('fast_val_acc', ckpt.get('val_acc', 0))
+        else:
+            # State dict only format (from policy training) - infer from weights
+            state_dict = ckpt
+            # Infer n_actions from action_embed weight: (n_actions, d_model)
+            n_actions = state_dict['action_embed.weight'].shape[0]
+            # Infer n_vocab from token_embed weight: (n_vocab, d_model)
+            n_vocab = state_dict['token_embed.weight'].shape[0]
+            # Infer token grid from position embeddings
+            if 'pos_embed' in state_dict:
+                # Old format: single pos_embed (1, token_h * token_w, d_model)
+                n_tokens = state_dict['pos_embed'].shape[1]
+                token_h = self.token_h
+                token_w = self.token_w
+            elif 'spatial_pos.row_embed.weight' in state_dict:
+                # New format: factorized 2D spatial position embeddings
+                token_h = state_dict['spatial_pos.row_embed.weight'].shape[0]
+                token_w = state_dict['spatial_pos.col_embed.weight'].shape[0]
+            else:
+                # Fallback to VQ-VAE dimensions
+                token_h = self.token_h
+                token_w = self.token_w
+            # Count transformer layers
+            n_layers = sum(1 for k in state_dict.keys() if k.startswith('transformer.') and k.endswith('.self_attn.in_proj_weight'))
+            self.wm_epoch = -1
+            self.wm_acc = 0
+            print(f"  (Loaded state_dict only - inferred: {n_actions} actions, {n_vocab} vocab, {n_layers} layers, {token_h}x{token_w} grid)")
         
         model = TemporalVisualWorldModel(
             n_vocab=n_vocab,
@@ -349,12 +390,8 @@ class AtariWorldPlayerHiRes:
             token_w=token_w,
             max_history=4,
         ).to(self.device)
-        model.load_state_dict(ckpt['model_state_dict'])
+        model.load_state_dict(state_dict)
         model.eval()
-        
-        # Store checkpoint info for display
-        self.wm_epoch = ckpt.get('epoch', -1) + 1  # Convert 0-indexed to 1-indexed
-        self.wm_acc = ckpt.get('fast_val_acc', ckpt.get('val_acc', 0))
         
         print(f"  Loaded World Model ({token_h}x{token_w}, {n_layers} layers, {n_vocab} vocab, epoch {self.wm_epoch}, acc={self.wm_acc:.1f}%)")
         
@@ -709,6 +746,8 @@ Use --stochastic, --temperature, --top-k to override.
                         help='Checkpoint name within run (e.g., epoch20, best)')
     parser.add_argument('--model-path', type=str, default=None,
                         help='Direct path to model checkpoint (overrides --run/--latest)')
+    parser.add_argument('--vqvae', type=str, default=None,
+                        help='Path to VQ-VAE checkpoint (default: auto-detect from base_dir)')
     
     # Inference settings (None = use config from run)
     parser.add_argument('--stochastic', action='store_true', default=None,
@@ -771,6 +810,7 @@ Use --stochastic, --temperature, --top-k to override.
     player = AtariWorldPlayerHiRes(
         game_config=game_config,
         model_path=model_path,
+        vqvae_path=args.vqvae,
         deterministic=deterministic_override,
         temperature=args.temperature,
         top_k=args.top_k,
