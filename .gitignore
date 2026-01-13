@@ -37,11 +37,36 @@ ENV/
 # Jupyter
 .ipynb_checkpoints/
 
-# Large files - DO NOT TRACK (use Git LFS or download separately)
-*.npz
-*.pt
-*.pth
-checkpoints/
+# =============================================================================
+# CHECKPOINTS - Careful rules for what to track vs ignore
+# =============================================================================
+
+# IGNORE: All experiment run directories (many large checkpoint files)
+checkpoints/v2/*/vqvae_runs/
+checkpoints/v2/*/wm_runs/
+checkpoints/v2/*/policy_runs/
+checkpoints/v2/*/runs/
+
+# IGNORE: All .pt files by default (checkpoints are large)
+checkpoints/**/*.pt
+
+# IGNORE: Intermediate/derived data files
+checkpoints/**/*tokens*.npz
+checkpoints/**/human_gameplay.npz
+checkpoints/**/test_*.npz
+
+# TRACK: Production checkpoints in final/ directories (via Git LFS)
+!checkpoints/v2/*/final/
+!checkpoints/v2/*/final/*.pt
+!checkpoints/v2/*/final/*.md
+
+# TRACK: Game data needed for reproducibility (via Git LFS)
+!checkpoints/v2/*/game_data.npz
+!checkpoints/v2/*/atari_game_data.npz
+
+# TRACK: Analysis images and config files
+!checkpoints/v2/*/*.png
+!checkpoints/v2/*/*.json
 
 # OS
 .DS_Store
